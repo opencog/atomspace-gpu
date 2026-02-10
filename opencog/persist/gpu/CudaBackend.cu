@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include <opencog/util/exceptions.h>
 #include <opencog/util/Logger.h>
@@ -210,6 +211,31 @@ __global__ void cuda_pair_find_or_create(
 	out_indices[idx] = CUDA_HT_EMPTY_VALUE;
 }
 
+// ----------------------------------------------------------
+// Incoming-set scan: find all pairs referencing a given word
+__global__ void cuda_incoming_scan(
+	const uint32_t* __restrict__ pair_word_a,
+	const uint32_t* __restrict__ pair_word_b,
+	uint32_t target_idx,
+	uint32_t pool_count,
+	uint32_t* __restrict__ match_indices,
+	uint32_t* __restrict__ match_count,
+	uint32_t max_matches)
+{
+	uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= pool_count) return;
+
+	uint32_t wa = pair_word_a[tid];
+	uint32_t wb = pair_word_b[tid];
+
+	if (wa == target_idx || wb == target_idx)
+	{
+		uint32_t pos = atomicAdd(match_count, 1U);
+		if (pos < max_matches)
+			match_indices[pos] = tid;
+	}
+}
+
 // ==============================================================
 // Host-side Implementation
 // ==============================================================
@@ -218,7 +244,7 @@ CudaBackend::CudaBackend()
 	: _device_id(-1),
 	  _d_word_name_hash(nullptr), _d_word_count(nullptr),
 	  _d_word_mi_marginal(nullptr), _d_word_class_id(nullptr),
-	  _d_word_next_free(nullptr),
+	  _d_word_type(nullptr), _d_word_next_free(nullptr),
 	  _d_pair_word_a(nullptr), _d_pair_word_b(nullptr),
 	  _d_pair_count(nullptr), _d_pair_mi(nullptr),
 	  _d_pair_flags(nullptr), _d_pair_next_free(nullptr),
@@ -310,6 +336,7 @@ void CudaBackend::shutdown()
 	if (_d_word_count)     cudaFree(_d_word_count);
 	if (_d_word_mi_marginal) cudaFree(_d_word_mi_marginal);
 	if (_d_word_class_id)  cudaFree(_d_word_class_id);
+	if (_d_word_type)      cudaFree(_d_word_type);
 	if (_d_word_next_free) cudaFree(_d_word_next_free);
 
 	if (_d_pair_word_a)    cudaFree(_d_pair_word_a);
@@ -342,6 +369,7 @@ void CudaBackend::shutdown()
 	_d_word_count = nullptr;
 	_d_word_mi_marginal = nullptr;
 	_d_word_class_id = nullptr;
+	_d_word_type = nullptr;
 	_d_word_next_free = nullptr;
 	_d_pair_word_a = nullptr;
 	_d_pair_word_b = nullptr;
@@ -386,6 +414,8 @@ void CudaBackend::alloc_pools()
 		sizeof(double) * GPU_WORD_CAPACITY), "alloc word_mi_marginal");
 	check_error(cudaMalloc(&_d_word_class_id,
 		sizeof(uint32_t) * GPU_WORD_CAPACITY), "alloc word_class_id");
+	check_error(cudaMalloc(&_d_word_type,
+		sizeof(uint16_t) * GPU_WORD_CAPACITY), "alloc word_type");
 	check_error(cudaMalloc(&_d_word_next_free,
 		sizeof(uint32_t)), "alloc word_next_free");
 
@@ -445,6 +475,9 @@ void CudaBackend::init_pools()
 	cudaMemcpy(_d_word_next_free, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
 	cudaMemcpy(_d_pair_next_free, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
 	cudaMemcpy(_d_sec_next_free, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice);
+
+	// Zero out word type array
+	cudaMemset(_d_word_type, 0, sizeof(uint16_t) * GPU_WORD_CAPACITY);
 
 	// Initialize hash table keys to EMPTY (0xFF bytes)
 	cudaMemset(_d_word_ht_keys,   0xFF, sizeof(uint64_t) * GPU_WORD_HT_CAPACITY);
@@ -512,6 +545,20 @@ void CudaBackend::word_read_values(uint32_t idx,
 		sizeof(double), cudaMemcpyDeviceToHost);
 }
 
+void CudaBackend::word_write_type(uint32_t idx, uint16_t type)
+{
+	cudaMemcpy(_d_word_type + idx, &type,
+		sizeof(uint16_t), cudaMemcpyHostToDevice);
+}
+
+uint16_t CudaBackend::word_read_type(uint32_t idx)
+{
+	uint16_t type = 0;
+	cudaMemcpy(&type, _d_word_type + idx,
+		sizeof(uint16_t), cudaMemcpyDeviceToHost);
+	return type;
+}
+
 void CudaBackend::word_delete(uint64_t name_hash)
 {
 	*_staging_key = name_hash;
@@ -532,7 +579,8 @@ uint32_t CudaBackend::word_pool_count()
 }
 
 void CudaBackend::word_read_bulk(uint32_t n, uint64_t* hashes,
-                                 double* counts, double* marginals)
+                                 double* counts, double* marginals,
+                                 uint16_t* types)
 {
 	cudaMemcpy(hashes, _d_word_name_hash,
 		sizeof(uint64_t) * n, cudaMemcpyDeviceToHost);
@@ -540,6 +588,8 @@ void CudaBackend::word_read_bulk(uint32_t n, uint64_t* hashes,
 		sizeof(double) * n, cudaMemcpyDeviceToHost);
 	cudaMemcpy(marginals, _d_word_mi_marginal,
 		sizeof(double) * n, cudaMemcpyDeviceToHost);
+	cudaMemcpy(types, _d_word_type,
+		sizeof(uint16_t) * n, cudaMemcpyDeviceToHost);
 }
 
 // ==============================================================
@@ -601,12 +651,100 @@ void CudaBackend::pair_read_values(uint32_t idx,
 		sizeof(double), cudaMemcpyDeviceToHost);
 }
 
+void CudaBackend::pair_write_type(uint32_t idx, uint16_t type)
+{
+	uint32_t val = (uint32_t)type;
+	cudaMemcpy(_d_pair_flags + idx, &val,
+		sizeof(uint32_t), cudaMemcpyHostToDevice);
+}
+
+uint16_t CudaBackend::pair_read_type(uint32_t idx)
+{
+	uint32_t val = 0;
+	cudaMemcpy(&val, _d_pair_flags + idx,
+		sizeof(uint32_t), cudaMemcpyDeviceToHost);
+	return (uint16_t)val;
+}
+
 uint32_t CudaBackend::pair_pool_count()
 {
 	uint32_t cnt = 0;
 	cudaMemcpy(&cnt, _d_pair_next_free,
 		sizeof(uint32_t), cudaMemcpyDeviceToHost);
 	return cnt;
+}
+
+// ==============================================================
+// Incoming-set scan (Phase 2)
+
+uint32_t CudaBackend::incoming_scan(uint32_t target_word_idx,
+                                     uint32_t* out_pair_indices,
+                                     uint32_t max_results)
+{
+	uint32_t pool_count = pair_pool_count();
+	if (pool_count == 0) return 0;
+
+	// Allocate device output buffers
+	uint32_t* d_match_indices = nullptr;
+	uint32_t* d_match_count = nullptr;
+
+	check_error(cudaMalloc(&d_match_indices,
+		sizeof(uint32_t) * max_results), "alloc match_indices");
+	check_error(cudaMallocManaged(&d_match_count,
+		sizeof(uint32_t)), "alloc match_count");
+
+	*d_match_count = 0;
+
+	int threads = 256;
+	int blocks = (pool_count + threads - 1) / threads;
+
+	cuda_incoming_scan<<<blocks, threads>>>(
+		_d_pair_word_a, _d_pair_word_b,
+		target_word_idx, pool_count,
+		d_match_indices, d_match_count, max_results);
+	cudaDeviceSynchronize();
+
+	uint32_t n = *d_match_count;
+	if (n > max_results) n = max_results;
+
+	if (n > 0)
+	{
+		cudaMemcpy(out_pair_indices, d_match_indices,
+			sizeof(uint32_t) * n, cudaMemcpyDeviceToHost);
+	}
+
+	cudaFree(d_match_indices);
+	cudaFree(d_match_count);
+
+	return n;
+}
+
+uint32_t CudaBackend::pair_read_bulk(uint32_t n,
+                                     uint32_t* word_a, uint32_t* word_b,
+                                     double* counts, double* mis,
+                                     uint16_t* types)
+{
+	uint32_t pool_count = pair_pool_count();
+	if (pool_count == 0) return 0;
+	if (n > pool_count) n = pool_count;
+
+	cudaMemcpy(word_a, _d_pair_word_a,
+		sizeof(uint32_t) * n, cudaMemcpyDeviceToHost);
+	cudaMemcpy(word_b, _d_pair_word_b,
+		sizeof(uint32_t) * n, cudaMemcpyDeviceToHost);
+	cudaMemcpy(counts, _d_pair_count,
+		sizeof(double) * n, cudaMemcpyDeviceToHost);
+	cudaMemcpy(mis, _d_pair_mi,
+		sizeof(double) * n, cudaMemcpyDeviceToHost);
+
+	// Read pair flags and convert uint32_t -> uint16_t types
+	std::vector<uint32_t> flags(n);
+	cudaMemcpy(flags.data(), _d_pair_flags,
+		sizeof(uint32_t) * n, cudaMemcpyDeviceToHost);
+	for (uint32_t i = 0; i < n; i++)
+		types[i] = (uint16_t)flags[i];
+
+	return n;
 }
 
 // ==============================================================

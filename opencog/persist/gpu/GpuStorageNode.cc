@@ -5,6 +5,9 @@
  * Delegates all GPU operations to a GpuBackend (CUDA or OpenCL).
  *
  * Phase 1: Store/Fetch round-trip for atoms and values.
+ * Phase 2: fetchIncomingByType, fetchIncomingSet, loadType, runQuery.
+ * Phase 2.5: Type-aware storage — atom Type stored in GPU pools,
+ *            mixed into hash key to prevent same-name collisions.
  *
  * Copyright (C) 2025 OpenCog Foundation
  *
@@ -22,6 +25,7 @@
 #include <opencog/atoms/base/Link.h>
 #include <opencog/atoms/value/FloatValue.h>
 #include <opencog/atoms/atom_types/atom_types.h>
+#include <opencog/atoms/atom_types/NameServer.h>
 #include <opencog/persist/gpu-types/atom_types.h>
 
 #include "GpuStorageNode.h"
@@ -60,11 +64,11 @@ GpuStorageNode::~GpuStorageNode()
 // URI parsing: "gpu://[backend:]platform:device"
 //
 // Extended URI format:
-//   "gpu://:"                  → auto backend, any device
-//   "gpu://NVIDIA:RTX"         → auto backend, NVIDIA RTX
-//   "gpu://cuda::"             → force CUDA, any device
-//   "gpu://opencl:Intel:"      → force OpenCL, Intel device
-//   "gpu://cuda:NVIDIA:RTX"    → CUDA, NVIDIA RTX
+//   "gpu://:"                  -> auto backend, any device
+//   "gpu://NVIDIA:RTX"         -> auto backend, NVIDIA RTX
+//   "gpu://cuda::"             -> force CUDA, any device
+//   "gpu://opencl:Intel:"      -> force OpenCL, Intel device
+//   "gpu://cuda:NVIDIA:RTX"    -> CUDA, NVIDIA RTX
 
 void GpuStorageNode::parse_uri(void)
 {
@@ -230,33 +234,35 @@ void GpuStorageNode::erase(void)
 }
 
 // ==============================================================
-// Name hashing
+// Name hashing — Type is mixed into the hash to prevent
+// same-name-different-type collisions.
 
-uint64_t GpuStorageNode::name_hash(const std::string& name)
+uint64_t GpuStorageNode::name_hash(Type t, const std::string& name)
 {
 	std::lock_guard<std::mutex> lk(_name_mtx);
 
-	auto it = _name_to_hash.find(name);
+	TypedName tn{t, name};
+	auto it = _name_to_hash.find(tn);
 	if (it != _name_to_hash.end())
 		return it->second;
 
-	// splitmix64 on std::hash
+	// Mix type into string hash via golden ratio constant
 	std::hash<std::string> hasher;
-	uint64_t h = hasher(name);
+	uint64_t h = hasher(name) ^ (uint64_t(t) * 0x9E3779B97F4A7C15ULL);
 
 	if (h == GPU_HT_EMPTY_KEY) h = 0;
 
-	_name_to_hash[name] = h;
-	_hash_to_name[h] = name;
+	_name_to_hash[tn] = h;
+	_hash_to_name[h] = tn;
 	return h;
 }
 
 // ==============================================================
 // GPU pool operations (delegated to backend)
 
-uint32_t GpuStorageNode::store_word(const std::string& name)
+uint32_t GpuStorageNode::store_word(Type t, const std::string& name)
 {
-	uint64_t nhash = name_hash(name);
+	uint64_t nhash = name_hash(t, name);
 	uint32_t idx = _backend->word_find_or_create(nhash);
 
 	if (idx == GPU_NOT_FOUND)
@@ -264,16 +270,18 @@ uint32_t GpuStorageNode::store_word(const std::string& name)
 			"GpuStorageNode: word pool full, cannot store '%s'\n",
 			name.c_str());
 
+	_backend->word_write_type(idx, (uint16_t)t);
 	return idx;
 }
 
-uint32_t GpuStorageNode::lookup_word(const std::string& name)
+uint32_t GpuStorageNode::lookup_word(Type t, const std::string& name)
 {
-	uint64_t nhash = name_hash(name);
+	uint64_t nhash = name_hash(t, name);
 	return _backend->word_lookup(nhash);
 }
 
-uint32_t GpuStorageNode::store_pair(uint32_t word_a, uint32_t word_b)
+uint32_t GpuStorageNode::store_pair(uint32_t word_a, uint32_t word_b,
+                                     Type link_type)
 {
 	uint32_t idx = _backend->pair_find_or_create(word_a, word_b);
 
@@ -281,6 +289,7 @@ uint32_t GpuStorageNode::store_pair(uint32_t word_a, uint32_t word_b)
 		throw RuntimeException(TRACE_INFO,
 			"GpuStorageNode: pair pool full\n");
 
+	_backend->pair_write_type(idx, (uint16_t)link_type);
 	return idx;
 }
 
@@ -358,7 +367,7 @@ void GpuStorageNode::storeAtom(const Handle& h, bool synchronous)
 	NodePtr np = NodeCast(h);
 	if (np)
 	{
-		uint32_t idx = store_word(np->get_name());
+		uint32_t idx = store_word(h->get_type(), np->get_name());
 		store_node_values(h, idx);
 
 		std::lock_guard<std::mutex> lk(_atom_mtx);
@@ -384,9 +393,9 @@ void GpuStorageNode::storeAtom(const Handle& h, bool synchronous)
 			NodePtr nb = NodeCast(hb);
 			if (na and nb)
 			{
-				uint32_t ia = store_word(na->get_name());
-				uint32_t ib = store_word(nb->get_name());
-				uint32_t pidx = store_pair(ia, ib);
+				uint32_t ia = store_word(ha->get_type(), na->get_name());
+				uint32_t ib = store_word(hb->get_type(), nb->get_name());
+				uint32_t pidx = store_pair(ia, ib, h->get_type());
 				store_link_values(h, pidx);
 
 				std::lock_guard<std::mutex> lk(_atom_mtx);
@@ -412,7 +421,7 @@ void GpuStorageNode::getAtom(const Handle& h)
 	NodePtr np = NodeCast(h);
 	if (np)
 	{
-		uint32_t idx = lookup_word(np->get_name());
+		uint32_t idx = lookup_word(h->get_type(), np->get_name());
 		if (idx == GPU_NOT_FOUND) return;
 
 		load_node_values(h, idx);
@@ -430,8 +439,8 @@ void GpuStorageNode::getAtom(const Handle& h)
 		NodePtr nb = NodeCast(hb);
 		if (na and nb)
 		{
-			uint32_t ia = lookup_word(na->get_name());
-			uint32_t ib = lookup_word(nb->get_name());
+			uint32_t ia = lookup_word(ha->get_type(), na->get_name());
+			uint32_t ib = lookup_word(hb->get_type(), nb->get_name());
 			if (ia == GPU_NOT_FOUND or ib == GPU_NOT_FOUND) return;
 
 			uint32_t pidx = lookup_pair(ia, ib);
@@ -457,7 +466,7 @@ void GpuStorageNode::storeValue(const Handle& atom, const Handle& key)
 	NodePtr np = NodeCast(atom);
 	if (np)
 	{
-		uint32_t idx = store_word(np->get_name());
+		uint32_t idx = store_word(atom->get_type(), np->get_name());
 		store_node_values(atom, idx);
 		return;
 	}
@@ -465,13 +474,15 @@ void GpuStorageNode::storeValue(const Handle& atom, const Handle& key)
 	LinkPtr lp = LinkCast(atom);
 	if (lp and lp->get_arity() == 2)
 	{
-		NodePtr na = NodeCast(lp->getOutgoingAtom(0));
-		NodePtr nb = NodeCast(lp->getOutgoingAtom(1));
+		const Handle& ha = lp->getOutgoingAtom(0);
+		const Handle& hb = lp->getOutgoingAtom(1);
+		NodePtr na = NodeCast(ha);
+		NodePtr nb = NodeCast(hb);
 		if (na and nb)
 		{
-			uint32_t ia = store_word(na->get_name());
-			uint32_t ib = store_word(nb->get_name());
-			uint32_t pidx = store_pair(ia, ib);
+			uint32_t ia = store_word(ha->get_type(), na->get_name());
+			uint32_t ib = store_word(hb->get_type(), nb->get_name());
+			uint32_t pidx = store_pair(ia, ib, atom->get_type());
 			store_link_values(atom, pidx);
 		}
 	}
@@ -488,7 +499,7 @@ void GpuStorageNode::loadValue(const Handle& atom, const Handle& key)
 	NodePtr np = NodeCast(atom);
 	if (np)
 	{
-		uint32_t idx = lookup_word(np->get_name());
+		uint32_t idx = lookup_word(atom->get_type(), np->get_name());
 		if (idx != GPU_NOT_FOUND)
 			load_node_values(atom, idx);
 		return;
@@ -497,12 +508,14 @@ void GpuStorageNode::loadValue(const Handle& atom, const Handle& key)
 	LinkPtr lp = LinkCast(atom);
 	if (lp and lp->get_arity() == 2)
 	{
-		NodePtr na = NodeCast(lp->getOutgoingAtom(0));
-		NodePtr nb = NodeCast(lp->getOutgoingAtom(1));
+		const Handle& ha = lp->getOutgoingAtom(0);
+		const Handle& hb = lp->getOutgoingAtom(1);
+		NodePtr na = NodeCast(ha);
+		NodePtr nb = NodeCast(hb);
 		if (na and nb)
 		{
-			uint32_t ia = lookup_word(na->get_name());
-			uint32_t ib = lookup_word(nb->get_name());
+			uint32_t ia = lookup_word(ha->get_type(), na->get_name());
+			uint32_t ib = lookup_word(hb->get_type(), nb->get_name());
 			if (ia != GPU_NOT_FOUND and ib != GPU_NOT_FOUND)
 			{
 				uint32_t pidx = lookup_pair(ia, ib);
@@ -525,7 +538,7 @@ void GpuStorageNode::removeAtom(AtomSpace*, const Handle& h, bool recursive)
 	NodePtr np = NodeCast(h);
 	if (np)
 	{
-		uint64_t nhash = name_hash(np->get_name());
+		uint64_t nhash = name_hash(h->get_type(), np->get_name());
 		_backend->word_delete(nhash);
 
 		std::lock_guard<std::mutex> lk(_atom_mtx);
@@ -536,16 +549,205 @@ void GpuStorageNode::removeAtom(AtomSpace*, const Handle& h, bool recursive)
 // ==============================================================
 // StorageNode API: bulk operations
 
-void GpuStorageNode::fetchIncomingSet(AtomSpace*, const Handle&)
+void GpuStorageNode::fetchIncomingSet(AtomSpace* as, const Handle& h)
 {
+	if (not _connected) return;
+
+	// fetchIncomingSet fetches all link types (type=0 means no filter).
+	fetchIncomingByType(as, h, (Type)0);
 }
 
-void GpuStorageNode::fetchIncomingByType(AtomSpace*, const Handle&, Type)
+void GpuStorageNode::fetchIncomingByType(AtomSpace* as,
+                                          const Handle& h, Type t)
 {
+	if (not _connected) return;
+
+	// We only store binary links in the pair pool.
+	NodePtr np = NodeCast(h);
+	if (nullptr == np) return;
+
+	uint32_t widx = lookup_word(h->get_type(), np->get_name());
+	if (widx == GPU_NOT_FOUND) return;
+
+	// GPU parallel scan: find all pairs containing this word
+	const uint32_t MAX_INCOMING = 16384;
+	std::vector<uint32_t> matches(MAX_INCOMING);
+	uint32_t n = _backend->incoming_scan(widx,
+		matches.data(), MAX_INCOMING);
+	if (0 == n) return;
+
+	// Bulk read the pair pool to get word indices, values, and types
+	uint32_t pool_count = _backend->pair_pool_count();
+	if (0 == pool_count) return;
+
+	std::vector<uint32_t> all_wa(pool_count), all_wb(pool_count);
+	std::vector<double> all_counts(pool_count), all_mis(pool_count);
+	std::vector<uint16_t> pair_types(pool_count);
+	_backend->pair_read_bulk(pool_count,
+		all_wa.data(), all_wb.data(),
+		all_counts.data(), all_mis.data(),
+		pair_types.data());
+
+	// Read word pool to reconstruct names and types
+	uint32_t word_count = _backend->word_pool_count();
+	std::vector<uint64_t> word_hashes(word_count);
+	std::vector<double> wcounts(word_count), wmarg(word_count);
+	std::vector<uint16_t> word_types(word_count);
+	_backend->word_read_bulk(word_count,
+		word_hashes.data(), wcounts.data(), wmarg.data(),
+		word_types.data());
+
+	// Build word-index-to-(type,name) map
+	struct TypeAndName { Type type; std::string name; };
+	std::unordered_map<uint32_t, TypeAndName> idx_to_info;
+	{
+		std::lock_guard<std::mutex> lk(_name_mtx);
+		for (uint32_t wi = 0; wi < word_count; wi++)
+		{
+			auto it = _hash_to_name.find(word_hashes[wi]);
+			if (it != _hash_to_name.end())
+				idx_to_info[wi] = {it->second.type, it->second.name};
+		}
+	}
+
+	// Reconstruct Link atoms in the target AtomSpace
+	for (uint32_t i = 0; i < n; i++)
+	{
+		uint32_t pidx = matches[i];
+		Type link_type = (Type)pair_types[pidx];
+
+		// Filter by type if requested (t==0 means all types)
+		if (t != 0 and link_type != t) continue;
+
+		uint32_t wa = all_wa[pidx];
+		uint32_t wb = all_wb[pidx];
+
+		auto ita = idx_to_info.find(wa);
+		auto itb = idx_to_info.find(wb);
+		if (ita == idx_to_info.end() or itb == idx_to_info.end())
+			continue;
+
+		Handle ha = as->add_node(ita->second.type,
+			std::string(ita->second.name));
+		Handle hb = as->add_node(itb->second.type,
+			std::string(itb->second.name));
+		Handle lnk = as->add_link(link_type, ha, hb);
+
+		double c = all_counts[pidx];
+		double m = all_mis[pidx];
+		if (c != 0.0 or m != 0.0)
+		{
+			std::vector<double> vals = {c, m};
+			lnk->setValue(truth_key(), createFloatValue(vals));
+		}
+	}
+
+	_num_fetches++;
 }
 
-void GpuStorageNode::loadType(AtomSpace*, Type)
+void GpuStorageNode::loadType(AtomSpace* as, Type t)
 {
+	if (not _connected) return;
+
+	// Check if caller is asking for a node type
+	if (nameserver().isA(t, NODE) or t == NODE)
+	{
+		// Load words from word pool, filtering by stored type
+		uint32_t nwords = _backend->word_pool_count();
+		if (0 == nwords) return;
+
+		std::vector<uint64_t> hashes(nwords);
+		std::vector<double> counts(nwords);
+		std::vector<double> marginals(nwords);
+		std::vector<uint16_t> types(nwords);
+		_backend->word_read_bulk(nwords, hashes.data(),
+			counts.data(), marginals.data(), types.data());
+
+		std::lock_guard<std::mutex> lk(_name_mtx);
+		for (uint32_t i = 0; i < nwords; i++)
+		{
+			Type stored_type = (Type)types[i];
+			// Filter: t==NODE loads all node types;
+			// otherwise only load matching type (including subtypes)
+			if (t != NODE and not nameserver().isA(stored_type, t))
+				continue;
+
+			auto it = _hash_to_name.find(hashes[i]);
+			if (it == _hash_to_name.end()) continue;
+
+			Handle h = as->add_node(stored_type,
+				std::string(it->second.name));
+			if (counts[i] != 0.0 or marginals[i] != 0.0)
+			{
+				std::vector<double> vals = {counts[i], marginals[i]};
+				h->setValue(truth_key(), createFloatValue(vals));
+			}
+		}
+		return;
+	}
+
+	// Check if caller is asking for a link type
+	if (nameserver().isA(t, LINK) or t == LINK)
+	{
+		// Load pairs from pair pool, filtering by stored link type
+		uint32_t npairs = _backend->pair_pool_count();
+		if (0 == npairs) return;
+
+		std::vector<uint32_t> wa(npairs), wb(npairs);
+		std::vector<double> counts(npairs), mis(npairs);
+		std::vector<uint16_t> pair_types(npairs);
+		_backend->pair_read_bulk(npairs,
+			wa.data(), wb.data(), counts.data(), mis.data(),
+			pair_types.data());
+
+		// Also read word pool for name+type reconstruction
+		uint32_t nwords = _backend->word_pool_count();
+		std::vector<uint64_t> word_hashes(nwords);
+		std::vector<double> wcounts(nwords), wmarg(nwords);
+		std::vector<uint16_t> word_types(nwords);
+		_backend->word_read_bulk(nwords,
+			word_hashes.data(), wcounts.data(), wmarg.data(),
+			word_types.data());
+
+		// Build index-to-(type,name) map
+		struct TypeAndName { Type type; std::string name; };
+		std::unordered_map<uint32_t, TypeAndName> idx_to_info;
+		{
+			std::lock_guard<std::mutex> lk(_name_mtx);
+			for (uint32_t i = 0; i < nwords; i++)
+			{
+				auto it = _hash_to_name.find(word_hashes[i]);
+				if (it != _hash_to_name.end())
+					idx_to_info[i] = {it->second.type, it->second.name};
+			}
+		}
+
+		for (uint32_t i = 0; i < npairs; i++)
+		{
+			Type stored_link_type = (Type)pair_types[i];
+			// Filter: t==LINK loads all link types;
+			// otherwise only load matching type (including subtypes)
+			if (t != LINK and not nameserver().isA(stored_link_type, t))
+				continue;
+
+			auto ita = idx_to_info.find(wa[i]);
+			auto itb = idx_to_info.find(wb[i]);
+			if (ita == idx_to_info.end() or itb == idx_to_info.end())
+				continue;
+
+			Handle ha = as->add_node(ita->second.type,
+				std::string(ita->second.name));
+			Handle hb = as->add_node(itb->second.type,
+				std::string(itb->second.name));
+			Handle lnk = as->add_link(stored_link_type, ha, hb);
+
+			if (counts[i] != 0.0 or mis[i] != 0.0)
+			{
+				std::vector<double> vals = {counts[i], mis[i]};
+				lnk->setValue(truth_key(), createFloatValue(vals));
+			}
+		}
+	}
 }
 
 void GpuStorageNode::loadAtomSpace(AtomSpace* as)
@@ -554,29 +756,10 @@ void GpuStorageNode::loadAtomSpace(AtomSpace* as)
 		throw RuntimeException(TRACE_INFO,
 			"GpuStorageNode: not connected!\n");
 
-	uint32_t nwords = _backend->word_pool_count();
-	if (0 == nwords) return;
-
-	std::vector<uint64_t> hashes(nwords);
-	std::vector<double> counts(nwords);
-	std::vector<double> marginals(nwords);
-	_backend->word_read_bulk(nwords, hashes.data(),
-		counts.data(), marginals.data());
-
-	std::lock_guard<std::mutex> lk(_name_mtx);
-	for (uint32_t i = 0; i < nwords; i++)
-	{
-		auto it = _hash_to_name.find(hashes[i]);
-		if (it == _hash_to_name.end()) continue;
-
-		std::string name = it->second;
-		Handle h = as->add_node(SCHEMA_NODE, std::move(name));
-		if (counts[i] != 0.0 or marginals[i] != 0.0)
-		{
-			std::vector<double> vals = {counts[i], marginals[i]};
-			h->setValue(truth_key(), createFloatValue(vals));
-		}
-	}
+	// Load all node types first (needed as outgoing atoms for links),
+	// then load all link types.
+	loadType(as, NODE);
+	loadType(as, LINK);
 }
 
 void GpuStorageNode::storeAtomSpace(const AtomSpace* as)
@@ -629,13 +812,30 @@ std::string GpuStorageNode::monitor(void)
 }
 
 // ==============================================================
-// Phase 2: runQuery (stub)
+// Phase 2: runQuery
+//
+// Delegates to the BackingStore default implementation, which uses
+// our fetchIncomingByType() callback during pattern matching.
+// We only add a cache check: if the result is already cached
+// and fresh==false, skip re-execution.
 
 void GpuStorageNode::runQuery(const Handle& query, const Handle& key,
                               const Handle& metadata_key, bool fresh)
 {
-	throw RuntimeException(TRACE_INFO,
-		"GpuStorageNode::runQuery() not yet implemented (Phase 2)\n");
+	if (not _connected)
+		throw RuntimeException(TRACE_INFO,
+			"GpuStorageNode: not connected!\n");
+
+	// Cache check: if result already exists and not forced fresh
+	if (not fresh)
+	{
+		ValuePtr vp = query->getValue(key);
+		if (vp) return;
+	}
+
+	// Delegate to base class — it uses our fetchIncomingByType
+	// during pattern matching graph crawl.
+	BackingStore::runQuery(query, key, metadata_key, fresh);
 }
 
 // ==============================================================

@@ -34,6 +34,7 @@ private:
 	double*   _d_word_count;
 	double*   _d_word_mi_marginal;
 	uint32_t* _d_word_class_id;
+	uint16_t* _d_word_type;
 	uint32_t* _d_word_next_free;
 
 	// Device memory -- PairPool SoA
@@ -85,10 +86,13 @@ public:
 	void word_write_marginal(uint32_t idx, double marginal) override;
 	void word_read_values(uint32_t idx,
 	                      double& count, double& marginal) override;
+	void word_write_type(uint32_t idx, uint16_t type) override;
+	uint16_t word_read_type(uint32_t idx) override;
 	void word_delete(uint64_t name_hash) override;
 	uint32_t word_pool_count() override;
 	void word_read_bulk(uint32_t n, uint64_t* hashes,
-	                    double* counts, double* marginals) override;
+	                    double* counts, double* marginals,
+	                    uint16_t* types) override;
 
 	uint32_t pair_find_or_create(uint32_t word_a,
 	                             uint32_t word_b) override;
@@ -97,9 +101,19 @@ public:
 	void pair_write_mi(uint32_t idx, double mi) override;
 	void pair_read_values(uint32_t idx,
 	                      double& count, double& mi) override;
+	void pair_write_type(uint32_t idx, uint16_t type) override;
+	uint16_t pair_read_type(uint32_t idx) override;
 	uint32_t pair_pool_count() override;
 
 	uint32_t section_pool_count() override;
+
+	uint32_t incoming_scan(uint32_t target_word_idx,
+	                       uint32_t* out_pair_indices,
+	                       uint32_t max_results) override;
+	uint32_t pair_read_bulk(uint32_t n,
+	                        uint32_t* word_a, uint32_t* word_b,
+	                        double* counts, double* mis,
+	                        uint16_t* types) override;
 
 	void barrier() override;
 };

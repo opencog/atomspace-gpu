@@ -12,6 +12,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 #include <opencog/util/exceptions.h>
 #include <opencog/util/Logger.h>
@@ -79,7 +80,7 @@ void OpenCLBackend::compile_kernels()
 	     << " -D PAIR_HT_CAPACITY=" << GPU_PAIR_HT_CAPACITY
 	     << " -D SECTION_HT_CAPACITY=" << GPU_SECTION_HT_CAPACITY;
 
-	std::string ht_src, as_src;
+	std::string ht_src, as_src, inc_src;
 	std::vector<std::string> search_paths = {
 		"/usr/local/share/opencog/opencl/gpu/",
 		"/usr/share/opencog/opencl/gpu/",
@@ -91,7 +92,8 @@ void OpenCLBackend::compile_kernels()
 
 	for (const auto& prefix : search_paths)
 	{
-		if (not ht_src.empty() and not as_src.empty()) break;
+		if (not ht_src.empty() and not as_src.empty()
+		    and not inc_src.empty()) break;
 
 		if (ht_src.empty())
 		{
@@ -107,6 +109,13 @@ void OpenCLBackend::compile_kernels()
 				as_src.assign(std::istreambuf_iterator<char>(f),
 				              std::istreambuf_iterator<char>());
 		}
+		if (inc_src.empty())
+		{
+			std::ifstream f(prefix + "gpu-incoming.cl");
+			if (f.is_open())
+				inc_src.assign(std::istreambuf_iterator<char>(f),
+				              std::istreambuf_iterator<char>());
+		}
 	}
 
 	if (ht_src.empty() or as_src.empty())
@@ -115,6 +124,8 @@ void OpenCLBackend::compile_kernels()
 			"or gpu-atomspace.cl kernel source files\n");
 
 	std::string combined = ht_src + "\n" + as_src;
+	if (not inc_src.empty())
+		combined += "\n" + inc_src;
 
 	cl::Program::Sources sources;
 	sources.push_back(combined);
@@ -172,6 +183,8 @@ void OpenCLBackend::alloc_pools()
 		sizeof(cl_double) * GPU_WORD_CAPACITY);
 	_word_class_id = cl::Buffer(_context, CL_MEM_READ_WRITE,
 		sizeof(cl_uint) * GPU_WORD_CAPACITY);
+	_word_type = cl::Buffer(_context, CL_MEM_READ_WRITE,
+		sizeof(cl_ushort) * GPU_WORD_CAPACITY);
 	_word_next_free = cl::Buffer(_context, CL_MEM_READ_WRITE,
 		sizeof(cl_uint));
 
@@ -220,6 +233,13 @@ void OpenCLBackend::init_pools()
 	_queue.enqueueWriteBuffer(_word_next_free, CL_TRUE, 0, sizeof(cl_uint), &zero);
 	_queue.enqueueWriteBuffer(_pair_next_free, CL_TRUE, 0, sizeof(cl_uint), &zero);
 	_queue.enqueueWriteBuffer(_sec_next_free, CL_TRUE, 0, sizeof(cl_uint), &zero);
+
+	// Zero out word type array
+	{
+		std::vector<cl_ushort> zt(GPU_WORD_CAPACITY, 0);
+		_queue.enqueueWriteBuffer(_word_type, CL_TRUE, 0,
+			sizeof(cl_ushort) * GPU_WORD_CAPACITY, zt.data());
+	}
 
 	// Initialize hash table keys to EMPTY, values to EMPTY.
 	// Use CL_TRUE (blocking) because host vectors go out of scope.
@@ -336,6 +356,21 @@ void OpenCLBackend::word_read_values(uint32_t idx,
 	marginal = m;
 }
 
+void OpenCLBackend::word_write_type(uint32_t idx, uint16_t type)
+{
+	cl_ushort v = type;
+	_queue.enqueueWriteBuffer(_word_type, CL_TRUE,
+		sizeof(cl_ushort) * idx, sizeof(cl_ushort), &v);
+}
+
+uint16_t OpenCLBackend::word_read_type(uint32_t idx)
+{
+	cl_ushort v = 0;
+	_queue.enqueueReadBuffer(_word_type, CL_TRUE,
+		sizeof(cl_ushort) * idx, sizeof(cl_ushort), &v);
+	return (uint16_t)v;
+}
+
 void OpenCLBackend::word_delete(uint64_t nhash)
 {
 	cl::Kernel kern(_program, "ht_delete");
@@ -362,7 +397,8 @@ uint32_t OpenCLBackend::word_pool_count()
 }
 
 void OpenCLBackend::word_read_bulk(uint32_t n, uint64_t* hashes,
-                                   double* counts, double* marginals)
+                                   double* counts, double* marginals,
+                                   uint16_t* types)
 {
 	_queue.enqueueReadBuffer(_word_name_hash, CL_TRUE, 0,
 		sizeof(cl_ulong) * n, hashes);
@@ -370,6 +406,8 @@ void OpenCLBackend::word_read_bulk(uint32_t n, uint64_t* hashes,
 		sizeof(cl_double) * n, counts);
 	_queue.enqueueReadBuffer(_word_mi_marginal, CL_TRUE, 0,
 		sizeof(cl_double) * n, marginals);
+	_queue.enqueueReadBuffer(_word_type, CL_TRUE, 0,
+		sizeof(cl_ushort) * n, types);
 }
 
 // ==============================================================
@@ -460,11 +498,105 @@ void OpenCLBackend::pair_read_values(uint32_t idx,
 	mi = m;
 }
 
+void OpenCLBackend::pair_write_type(uint32_t idx, uint16_t type)
+{
+	cl_uint val = (cl_uint)type;
+	_queue.enqueueWriteBuffer(_pair_flags, CL_TRUE,
+		sizeof(cl_uint) * idx, sizeof(cl_uint), &val);
+}
+
+uint16_t OpenCLBackend::pair_read_type(uint32_t idx)
+{
+	cl_uint val = 0;
+	_queue.enqueueReadBuffer(_pair_flags, CL_TRUE,
+		sizeof(cl_uint) * idx, sizeof(cl_uint), &val);
+	return (uint16_t)val;
+}
+
 uint32_t OpenCLBackend::pair_pool_count()
 {
 	cl_uint cnt = 0;
 	_queue.enqueueReadBuffer(_pair_next_free, CL_TRUE, 0, sizeof(cl_uint), &cnt);
 	return cnt;
+}
+
+// ==============================================================
+// Incoming-set scan (Phase 2)
+
+uint32_t OpenCLBackend::incoming_scan(uint32_t target_word_idx,
+                                       uint32_t* out_pair_indices,
+                                       uint32_t max_results)
+{
+	uint32_t pool_count = pair_pool_count();
+	if (pool_count == 0) return 0;
+
+	cl::Kernel kern(_program, "incoming_scan");
+
+	// Output buffers
+	cl::Buffer match_buf(_context, CL_MEM_WRITE_ONLY,
+		sizeof(cl_uint) * max_results);
+	cl::Buffer count_buf(_context, CL_MEM_READ_WRITE, sizeof(cl_uint));
+
+	// Initialize match count to zero
+	cl_uint zero = 0;
+	_queue.enqueueWriteBuffer(count_buf, CL_TRUE, 0, sizeof(cl_uint), &zero);
+
+	kern.setArg(0, _pair_word_a);
+	kern.setArg(1, _pair_word_b);
+	kern.setArg(2, (cl_uint)target_word_idx);
+	kern.setArg(3, (cl_uint)pool_count);
+	kern.setArg(4, match_buf);
+	kern.setArg(5, count_buf);
+	kern.setArg(6, (cl_uint)max_results);
+
+	// Launch one thread per pair slot
+	size_t global_size = ((pool_count + 255) / 256) * 256;
+	_queue.enqueueNDRangeKernel(kern, cl::NullRange,
+		cl::NDRange(global_size), cl::NDRange(256));
+
+	// Read back match count
+	cl_uint match_count = 0;
+	_queue.enqueueReadBuffer(count_buf, CL_TRUE, 0,
+		sizeof(cl_uint), &match_count);
+
+	if (match_count > max_results)
+		match_count = max_results;
+
+	if (match_count > 0)
+	{
+		_queue.enqueueReadBuffer(match_buf, CL_TRUE, 0,
+			sizeof(cl_uint) * match_count, out_pair_indices);
+	}
+
+	return match_count;
+}
+
+uint32_t OpenCLBackend::pair_read_bulk(uint32_t n,
+                                       uint32_t* word_a, uint32_t* word_b,
+                                       double* counts, double* mis,
+                                       uint16_t* types)
+{
+	uint32_t pool_count = pair_pool_count();
+	if (pool_count == 0) return 0;
+	if (n > pool_count) n = pool_count;
+
+	_queue.enqueueReadBuffer(_pair_word_a, CL_TRUE, 0,
+		sizeof(cl_uint) * n, word_a);
+	_queue.enqueueReadBuffer(_pair_word_b, CL_TRUE, 0,
+		sizeof(cl_uint) * n, word_b);
+	_queue.enqueueReadBuffer(_pair_count, CL_TRUE, 0,
+		sizeof(cl_double) * n, counts);
+	_queue.enqueueReadBuffer(_pair_mi, CL_TRUE, 0,
+		sizeof(cl_double) * n, mis);
+
+	// Read pair flags and convert uint32_t -> uint16_t types
+	std::vector<cl_uint> flags(n);
+	_queue.enqueueReadBuffer(_pair_flags, CL_TRUE, 0,
+		sizeof(cl_uint) * n, flags.data());
+	for (uint32_t i = 0; i < n; i++)
+		types[i] = (uint16_t)flags[i];
+
+	return n;
 }
 
 // ==============================================================

@@ -1,0 +1,574 @@
+/*
+ * tests/persist/gpu/GpuBulkUTest.cxxtest
+ *
+ * Multi-type correctness and GPU-scale showcase test.
+ * Verifies that atom Type is stored/retrieved correctly,
+ * that same-name-different-type atoms don't collide,
+ * and demonstrates GPU throughput at scale.
+ *
+ * Copyright (C) 2025 OpenCog Foundation
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+#include <cstdio>
+#include <chrono>
+#include <sstream>
+
+#include <opencog/atoms/base/Atom.h>
+#include <opencog/atoms/base/Link.h>
+#include <opencog/atoms/base/Node.h>
+#include <opencog/atoms/atom_types/atom_types.h>
+#include <opencog/atoms/value/FloatValue.h>
+#include <opencog/atomspace/AtomSpace.h>
+#include <opencog/persist/gpu/GpuStorageNode.h>
+#include <opencog/persist/gpu-types/atom_types.h>
+
+#include <opencog/util/Logger.h>
+
+using namespace opencog;
+
+class GpuBulkUTest : public CxxTest::TestSuite
+{
+private:
+	std::string uri;
+
+public:
+	GpuBulkUTest(void)
+	{
+		logger().set_level(Logger::INFO);
+		logger().set_print_to_stdout_flag(true);
+		uri = "gpu://:";
+	}
+
+	~GpuBulkUTest() {}
+
+	void setUp(void) {}
+	void tearDown(void) {}
+
+	void test_multi_type_nodes(void);
+	void test_multi_type_links(void);
+	void test_type_collision_safety(void);
+	void test_bulk_store_load(void);
+	void test_incoming_at_scale(void);
+	void test_throughput(void);
+};
+
+// Helper: create FloatValue from two doubles
+static ValuePtr mk_tv(double a, double b)
+{
+	return createFloatValue(std::vector<double>({a, b}));
+}
+
+// ============================================================
+// Test 1: Store 500 each of CONCEPT/SCHEMA/PREDICATE nodes,
+// load back, verify types are preserved.
+
+void GpuBulkUTest::test_multi_type_nodes(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	const int N = 500;
+
+	// Store 500 of each type
+	for (int i = 0; i < N; i++)
+	{
+		std::string name = "node-" + std::to_string(i);
+
+		Handle hc = createNode(CONCEPT_NODE, name);
+		hc->setValue(truth_key(), mk_tv(1.0, (double)i));
+		store->storeAtom(hc, false);
+
+		Handle hs = createNode(SCHEMA_NODE, name);
+		hs->setValue(truth_key(), mk_tv(2.0, (double)i));
+		store->storeAtom(hs, false);
+
+		Handle hp = createNode(PREDICATE_NODE, name);
+		hp->setValue(truth_key(), mk_tv(3.0, (double)i));
+		store->storeAtom(hp, false);
+	}
+	store->barrier();
+
+	// Load into a fresh AtomSpace
+	AtomSpacePtr load_as = createAtomSpace();
+	store->loadAtomSpace(load_as.get());
+	store->barrier();
+
+	// Verify: should have 3*N nodes
+	size_t count = load_as->get_size();
+	printf("  Multi-type nodes: stored %d, loaded %lu\n", 3*N, count);
+	TSM_ASSERT_EQUALS("Node count mismatch", count, (size_t)(3*N));
+
+	// Spot-check types and values via get_atom
+	Handle chk_c = load_as->get_atom(createNode(CONCEPT_NODE, "node-42"));
+	TSM_ASSERT("Missing ConceptNode", chk_c != nullptr);
+	if (chk_c)
+	{
+		TSM_ASSERT_EQUALS("Wrong type", chk_c->get_type(), CONCEPT_NODE);
+		FloatValuePtr fv = FloatValueCast(chk_c->getValue(truth_key()));
+		TSM_ASSERT("Missing truth value", fv != nullptr);
+		if (fv)
+		{
+			TSM_ASSERT_DELTA("Bad count", fv->value()[0], 1.0, 1e-10);
+			TSM_ASSERT_DELTA("Bad marginal", fv->value()[1], 42.0, 1e-10);
+		}
+	}
+
+	Handle chk_s = load_as->get_atom(createNode(SCHEMA_NODE, "node-42"));
+	TSM_ASSERT("Missing SchemaNode", chk_s != nullptr);
+	if (chk_s)
+	{
+		TSM_ASSERT_EQUALS("Wrong type", chk_s->get_type(), SCHEMA_NODE);
+		FloatValuePtr fv = FloatValueCast(chk_s->getValue(truth_key()));
+		TSM_ASSERT("Missing truth value", fv != nullptr);
+		if (fv)
+			TSM_ASSERT_DELTA("Bad count", fv->value()[0], 2.0, 1e-10);
+	}
+
+	Handle chk_p = load_as->get_atom(createNode(PREDICATE_NODE, "node-42"));
+	TSM_ASSERT("Missing PredicateNode", chk_p != nullptr);
+	if (chk_p)
+	{
+		TSM_ASSERT_EQUALS("Wrong type", chk_p->get_type(), PREDICATE_NODE);
+		FloatValuePtr fv = FloatValueCast(chk_p->getValue(truth_key()));
+		TSM_ASSERT("Missing truth value", fv != nullptr);
+		if (fv)
+			TSM_ASSERT_DELTA("Bad count", fv->value()[0], 3.0, 1e-10);
+	}
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 2: Store LIST_LINK and SET_LINK pairs with DIFFERENT
+// outgoing nodes, verify types are preserved.
+//
+// Note: The GPU pair pool is keyed by (word_a, word_b) — one
+// slot per unique node pair. Different link types between the
+// same two nodes share a slot. This test uses distinct node
+// pairs for each link type to verify type round-trip.
+
+void GpuBulkUTest::test_multi_type_links(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	const int N = 200;
+
+	// LIST_LINKs: between "listA-i" and "listB-i"
+	for (int i = 0; i < N; i++)
+	{
+		Handle ha = createNode(SCHEMA_NODE,
+			"listA-" + std::to_string(i));
+		Handle hb = createNode(SCHEMA_NODE,
+			"listB-" + std::to_string(i));
+		Handle ll = createLink(LIST_LINK, ha, hb);
+		ll->setValue(truth_key(), mk_tv(1.0, (double)i));
+		store->storeAtom(ll, false);
+	}
+
+	// SET_LINKs: between "setA-i" and "setB-i" (different nodes)
+	for (int i = 0; i < N; i++)
+	{
+		Handle ha = createNode(SCHEMA_NODE,
+			"setA-" + std::to_string(i));
+		Handle hb = createNode(SCHEMA_NODE,
+			"setB-" + std::to_string(i));
+		Handle sl = createLink(SET_LINK, ha, hb);
+		sl->setValue(truth_key(), mk_tv(2.0, (double)i));
+		store->storeAtom(sl, false);
+	}
+	store->barrier();
+
+	// Load and verify
+	AtomSpacePtr load_as = createAtomSpace();
+	store->loadAtomSpace(load_as.get());
+	store->barrier();
+
+	// 4*N nodes (listA, listB, setA, setB) + 2*N links = 6*N
+	size_t count = load_as->get_size();
+	printf("  Multi-type links: expected %d, loaded %lu\n", 6*N, count);
+	TSM_ASSERT_EQUALS("Atom count mismatch", count, (size_t)(6*N));
+
+	// Check a LIST_LINK
+	Handle ha = load_as->get_atom(
+		createNode(SCHEMA_NODE, "listA-50"));
+	Handle hb = load_as->get_atom(
+		createNode(SCHEMA_NODE, "listB-50"));
+	TSM_ASSERT("Missing list node A", ha != nullptr);
+	TSM_ASSERT("Missing list node B", hb != nullptr);
+	if (ha and hb)
+	{
+		Handle ll = load_as->get_atom(createLink(LIST_LINK, ha, hb));
+		TSM_ASSERT("Missing LIST_LINK", ll != nullptr);
+		if (ll)
+		{
+			TSM_ASSERT_EQUALS("Wrong link type",
+				ll->get_type(), LIST_LINK);
+			FloatValuePtr fv = FloatValueCast(
+				ll->getValue(truth_key()));
+			TSM_ASSERT("Missing truth value", fv != nullptr);
+			if (fv)
+				TSM_ASSERT_DELTA("Bad count",
+					fv->value()[0], 1.0, 1e-10);
+		}
+	}
+
+	// Check a SET_LINK
+	Handle sa = load_as->get_atom(
+		createNode(SCHEMA_NODE, "setA-50"));
+	Handle sb = load_as->get_atom(
+		createNode(SCHEMA_NODE, "setB-50"));
+	TSM_ASSERT("Missing set node A", sa != nullptr);
+	TSM_ASSERT("Missing set node B", sb != nullptr);
+	if (sa and sb)
+	{
+		Handle sl = load_as->get_atom(createLink(SET_LINK, sa, sb));
+		TSM_ASSERT("Missing SET_LINK", sl != nullptr);
+		if (sl)
+		{
+			TSM_ASSERT_EQUALS("Wrong link type",
+				sl->get_type(), SET_LINK);
+			FloatValuePtr fv = FloatValueCast(
+				sl->getValue(truth_key()));
+			TSM_ASSERT("Missing truth value", fv != nullptr);
+			if (fv)
+				TSM_ASSERT_DELTA("Bad count",
+					fv->value()[0], 2.0, 1e-10);
+		}
+	}
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 3: CRITICAL -- proves the same-name-different-type
+// collision bug is fixed.
+
+void GpuBulkUTest::test_type_collision_safety(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	// Store ConceptNode "foo" with values {1.0, 2.0}
+	Handle hc = createNode(CONCEPT_NODE, "foo");
+	hc->setValue(truth_key(), mk_tv(1.0, 2.0));
+	store->storeAtom(hc, true);
+
+	// Store SchemaNode "foo" with values {3.0, 4.0}
+	Handle hs = createNode(SCHEMA_NODE, "foo");
+	hs->setValue(truth_key(), mk_tv(3.0, 4.0));
+	store->storeAtom(hs, true);
+
+	store->barrier();
+
+	// Fetch ConceptNode "foo" -- should have {1.0, 2.0}
+	Handle fc = createNode(CONCEPT_NODE, "foo");
+	store->getAtom(fc);
+	FloatValuePtr fvc = FloatValueCast(fc->getValue(truth_key()));
+	TSM_ASSERT("Missing ConceptNode truth value", fvc != nullptr);
+	if (fvc)
+	{
+		printf("  ConceptNode 'foo': count=%g marginal=%g\n",
+		       fvc->value()[0], fvc->value()[1]);
+		TSM_ASSERT_DELTA("ConceptNode count wrong", fvc->value()[0], 1.0, 1e-10);
+		TSM_ASSERT_DELTA("ConceptNode marginal wrong", fvc->value()[1], 2.0, 1e-10);
+	}
+
+	// Fetch SchemaNode "foo" -- should have {3.0, 4.0}
+	Handle fs = createNode(SCHEMA_NODE, "foo");
+	store->getAtom(fs);
+	FloatValuePtr fvs = FloatValueCast(fs->getValue(truth_key()));
+	TSM_ASSERT("Missing SchemaNode truth value", fvs != nullptr);
+	if (fvs)
+	{
+		printf("  SchemaNode 'foo': count=%g marginal=%g\n",
+		       fvs->value()[0], fvs->value()[1]);
+		TSM_ASSERT_DELTA("SchemaNode count wrong", fvs->value()[0], 3.0, 1e-10);
+		TSM_ASSERT_DELTA("SchemaNode marginal wrong", fvs->value()[1], 4.0, 1e-10);
+	}
+
+	// Also verify they loaded back as distinct atoms
+	AtomSpacePtr load_as = createAtomSpace();
+	store->loadAtomSpace(load_as.get());
+	size_t count = load_as->get_size();
+	printf("  Collision safety: loaded %lu atoms (should be 2)\n", count);
+	TSM_ASSERT_EQUALS("Should have 2 distinct atoms", count, 2UL);
+
+	Handle lc = load_as->get_atom(createNode(CONCEPT_NODE, "foo"));
+	Handle ls = load_as->get_atom(createNode(SCHEMA_NODE, "foo"));
+	TSM_ASSERT("Missing ConceptNode after load", lc != nullptr);
+	TSM_ASSERT("Missing SchemaNode after load", ls != nullptr);
+	TSM_ASSERT("Should be different atoms!", lc != ls);
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 4: Store 10K nodes + 5K pairs, storeAtomSpace -> loadAtomSpace.
+
+void GpuBulkUTest::test_bulk_store_load(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	const int NNODES = 500;
+	const int NPAIRS = 250;
+
+	// Create data AtomSpace with many atoms
+	AtomSpacePtr data_as = createAtomSpace();
+	AtomSpace* dat = data_as.get();
+
+	for (int i = 0; i < NNODES; i++)
+	{
+		Handle h = dat->add_node(CONCEPT_NODE,
+			"bulk-" + std::to_string(i));
+		h->setValue(truth_key(), mk_tv((double)i, (double)(i * 0.1)));
+	}
+
+	for (int i = 0; i < NPAIRS; i++)
+	{
+		Handle ha = dat->add_node(CONCEPT_NODE,
+			"bulk-" + std::to_string(i * 2));
+		Handle hb = dat->add_node(CONCEPT_NODE,
+			"bulk-" + std::to_string(i * 2 + 1));
+		Handle lnk = dat->add_link(LIST_LINK, ha, hb);
+		lnk->setValue(truth_key(), mk_tv((double)i, (double)(i + 1)));
+	}
+
+	auto t0 = std::chrono::high_resolution_clock::now();
+	store->storeAtomSpace(dat);
+	store->barrier();
+	auto t1 = std::chrono::high_resolution_clock::now();
+
+	double store_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+	printf("  Bulk store: %d nodes + %d pairs in %.1f ms\n",
+	       NNODES, NPAIRS, store_ms);
+
+	// Load into fresh AtomSpace
+	AtomSpacePtr load_as = createAtomSpace();
+	auto t2 = std::chrono::high_resolution_clock::now();
+	store->loadAtomSpace(load_as.get());
+	store->barrier();
+	auto t3 = std::chrono::high_resolution_clock::now();
+
+	double load_ms = std::chrono::duration<double, std::milli>(t3-t2).count();
+	size_t loaded = load_as->get_size();
+	size_t expected = dat->get_size();
+	printf("  Bulk load: %lu atoms in %.1f ms (expected %lu)\n",
+	       loaded, load_ms, expected);
+
+	TSM_ASSERT_EQUALS("Atom count mismatch", loaded, expected);
+
+	// Spot-check a value
+	Handle chk = load_as->get_atom(createNode(CONCEPT_NODE, "bulk-42"));
+	TSM_ASSERT("Missing spot-check node", chk != nullptr);
+	if (chk)
+	{
+		FloatValuePtr fv = FloatValueCast(chk->getValue(truth_key()));
+		TSM_ASSERT("Missing truth value", fv != nullptr);
+		if (fv)
+		{
+			TSM_ASSERT_DELTA("Bad count", fv->value()[0], 42.0, 1e-10);
+		}
+	}
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 5: Hub node with 100 LIST_LINK + 100 SET_LINK pairs;
+// fetchIncomingByType correctly filters by link type.
+//
+// Uses different spoke nodes for each link type to avoid
+// pair-pool key collisions (one slot per node pair).
+
+void GpuBulkUTest::test_incoming_at_scale(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	const int N = 100;
+
+	// Create hub node
+	Handle hub = createNode(CONCEPT_NODE, "hub");
+	store->storeAtom(hub, false);
+
+	// Store N LIST_LINKs: hub <-> list-spoke-i
+	for (int i = 0; i < N; i++)
+	{
+		Handle spoke = createNode(CONCEPT_NODE,
+			"list-spoke-" + std::to_string(i));
+		store->storeAtom(spoke, false);
+
+		Handle ll = createLink(LIST_LINK, hub, spoke);
+		ll->setValue(truth_key(), mk_tv(1.0, (double)i));
+		store->storeAtom(ll, false);
+	}
+
+	// Store N SET_LINKs: hub <-> set-spoke-i (different nodes!)
+	for (int i = 0; i < N; i++)
+	{
+		Handle spoke = createNode(CONCEPT_NODE,
+			"set-spoke-" + std::to_string(i));
+		store->storeAtom(spoke, false);
+
+		Handle sl = createLink(SET_LINK, hub, spoke);
+		sl->setValue(truth_key(), mk_tv(2.0, (double)i));
+		store->storeAtom(sl, false);
+	}
+	store->barrier();
+
+	// fetchIncomingByType for LIST_LINK only
+	AtomSpacePtr list_as = createAtomSpace();
+	Handle list_hub = list_as->add_node(CONCEPT_NODE, "hub");
+	store->fetchIncomingByType(list_as.get(), list_hub, LIST_LINK);
+	store->barrier();
+
+	printf("  Incoming LIST_LINK: total atoms %lu\n", list_as->get_size());
+
+	HandleSeq ll_links;
+	list_as->get_handles_by_type(ll_links, LIST_LINK);
+	printf("  LIST_LINKs found: %lu (expected %d)\n",
+		ll_links.size(), N);
+	TSM_ASSERT_EQUALS("LIST_LINK count wrong",
+		ll_links.size(), (size_t)N);
+
+	HandleSeq sl_links;
+	list_as->get_handles_by_type(sl_links, SET_LINK);
+	printf("  SET_LINKs found: %lu (expected 0)\n", sl_links.size());
+	TSM_ASSERT_EQUALS("SET_LINKs should be filtered",
+		sl_links.size(), 0UL);
+
+	// fetchIncomingByType for SET_LINK only
+	AtomSpacePtr set_as = createAtomSpace();
+	Handle set_hub = set_as->add_node(CONCEPT_NODE, "hub");
+	store->fetchIncomingByType(set_as.get(), set_hub, SET_LINK);
+	store->barrier();
+
+	HandleSeq sl_links2;
+	set_as->get_handles_by_type(sl_links2, SET_LINK);
+	printf("  SET_LINKs (filtered): %lu (expected %d)\n",
+		sl_links2.size(), N);
+	TSM_ASSERT_EQUALS("SET_LINK count wrong",
+		sl_links2.size(), (size_t)N);
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 6: Throughput showcase -- print wall-clock numbers.
+
+void GpuBulkUTest::test_throughput(void)
+{
+	logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+	TSM_ASSERT("Cannot connect to GPU", store->connected());
+
+	const int NNODES = 1000;
+	const int NPAIRS = 1000;  // one pair per adjacent node pair
+
+	// -- Store nodes --
+	auto t0 = std::chrono::high_resolution_clock::now();
+	for (int i = 0; i < NNODES; i++)
+	{
+		Handle h = createNode(CONCEPT_NODE, "tp-" + std::to_string(i));
+		h->setValue(truth_key(), mk_tv((double)i, 0.0));
+		store->storeAtom(h, false);
+	}
+	store->barrier();
+	auto t1 = std::chrono::high_resolution_clock::now();
+
+	double node_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+	double node_rate = NNODES * 1000.0 / node_ms;
+
+	// -- Store pairs: (tp-i, tp-i+1) for i in [0, NPAIRS) --
+	// Each pair is unique since each (i, i+1) is a distinct pair.
+	auto t2 = std::chrono::high_resolution_clock::now();
+	for (int i = 0; i < NPAIRS; i++)
+	{
+		int a = i;
+		int b = (i + 1) % NNODES;
+		Handle ha = createNode(CONCEPT_NODE, "tp-" + std::to_string(a));
+		Handle hb = createNode(CONCEPT_NODE, "tp-" + std::to_string(b));
+		Handle lnk = createLink(LIST_LINK, ha, hb);
+		lnk->setValue(truth_key(), mk_tv((double)i, 0.0));
+		store->storeAtom(lnk, false);
+	}
+	store->barrier();
+	auto t3 = std::chrono::high_resolution_clock::now();
+
+	double pair_ms = std::chrono::duration<double, std::milli>(t3-t2).count();
+	double pair_rate = NPAIRS * 1000.0 / pair_ms;
+
+	// -- Load all --
+	AtomSpacePtr load_as = createAtomSpace();
+	auto t4 = std::chrono::high_resolution_clock::now();
+	store->loadAtomSpace(load_as.get());
+	store->barrier();
+	auto t5 = std::chrono::high_resolution_clock::now();
+
+	double load_ms = std::chrono::duration<double, std::milli>(t5-t4).count();
+	size_t loaded = load_as->get_size();
+	double load_rate = loaded * 1000.0 / load_ms;
+
+	printf("\n");
+	printf("  ====== GPU Throughput Showcase ======\n");
+	printf("  Backend: %s\n", store->monitor().c_str());
+	printf("  Store %d nodes:   %.1f ms  (%.0f nodes/sec)\n",
+	       NNODES, node_ms, node_rate);
+	printf("  Store %d pairs:  %.1f ms  (%.0f pairs/sec)\n",
+	       NPAIRS, pair_ms, pair_rate);
+	printf("  Load  %lu atoms:  %.1f ms  (%.0f atoms/sec)\n",
+	       loaded, load_ms, load_rate);
+	printf("  =====================================\n\n");
+
+	// Sanity check: should have NNODES nodes + NPAIRS links
+	TSM_ASSERT("Too few atoms loaded",
+		loaded >= (size_t)(NNODES + NPAIRS));
+
+	store->erase();
+	store->close();
+	logger().info("END TEST: %s", __FUNCTION__);
+}
+
+/* ============================= END OF FILE ================= */

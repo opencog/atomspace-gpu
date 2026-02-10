@@ -1,0 +1,384 @@
+/*
+ * tests/persist/gpu/BasicSaveUTest.cxxtest
+ *
+ * Most basic, simplest sniff test, saves and restores a few atoms.
+ * Adapted from tests/persist/rocks/BasicSaveUTest.cxxtest.
+ *
+ * The GPU backend supports SCHEMA_NODE (word pool) and binary
+ * LIST_LINK (pair pool). The Rocks version uses CONCEPT_NODE,
+ * NUMBER_NODE, and 4-arity SET_LINK; those are adapted here
+ * for GPU constraints.
+ *
+ * GPU storage is volatile (in-memory), so test_table verifies
+ * storeAtomSpace + loadAtomSpace within a single connection,
+ * rather than across close/reopen.
+ *
+ * Copyright (C) 2008, 2009, 2019 Linas Vepstas <linasvepstas@gmail.com>
+ * Copyright (C) 2025 OpenCog Foundation
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+#include <cstdio>
+
+#include <opencog/atoms/base/Atom.h>
+#include <opencog/atoms/base/Link.h>
+#include <opencog/atoms/base/Node.h>
+#include <opencog/atoms/atom_types/atom_types.h>
+#include <opencog/atoms/value/FloatValue.h>
+#include <opencog/atoms/value/VoidValue.h>
+#include <opencog/atomspace/AtomSpace.h>
+#include <opencog/persist/gpu/GpuStorageNode.h>
+#include <opencog/persist/gpu-types/atom_types.h>
+
+#include <opencog/util/Logger.h>
+
+using namespace opencog;
+
+class BasicSaveUTest : public CxxTest::TestSuite
+{
+	private:
+		std::string uri;
+
+		// Per-table-row atoms: 2 nodes + 1 binary link
+		Handle n1[10];
+		Handle n2[10];
+		Handle   l[10];
+		Handle a1[10];
+		Handle a2[10];
+		Handle al[10];
+
+	public:
+		BasicSaveUTest(void)
+		{
+			logger().set_level(Logger::INFO);
+			// logger().set_level(Logger::DEBUG);
+			logger().set_print_to_stdout_flag(true);
+			logger().set_sync_flag(true);
+
+			uri = "gpu://:";
+		}
+
+		~BasicSaveUTest() {}
+
+		void setUp(void) {}
+		void tearDown(void) {}
+
+		void single_atom_save_restore(std::string id);
+		void add_to_table(int, AtomSpace*, std::string id);
+		void check_table(int, AtomSpace*, std::string id);
+
+		void test_single_atom(void);
+		void test_fresh_atom(void);
+		void test_table(void);
+};
+
+// ============================================================
+
+static void atomCompare(Handle a, Handle b, const char* where)
+{
+	printf("Testing at %s\n", where);
+	TSM_ASSERT("No atom found", b != nullptr);
+	if (nullptr == b) return;
+
+	TSM_ASSERT_EQUALS("Type mismatch", a->get_type(), b->get_type());
+
+	NodePtr na(NodeCast(a));
+	NodePtr nb(NodeCast(b));
+	if (na and nb)
+	{
+		TSM_ASSERT_EQUALS("Name mismatch", na->get_name(), nb->get_name());
+	}
+
+	LinkPtr la(LinkCast(a));
+	LinkPtr lb(LinkCast(b));
+	if (la and lb)
+	{
+		TSM_ASSERT_EQUALS("Arity mismatch", la->get_arity(), lb->get_arity());
+		if (*la != *lb)
+		{
+			printf("Mismatching la = %s\n", la->to_string().c_str());
+			printf("Mismatching lb = %s\n", lb->to_string().c_str());
+			TSM_ASSERT_EQUALS("Link mis-match", la, lb);
+		}
+	}
+
+	ValuePtr ta = a->getValue(truth_key());
+	ValuePtr tb = b->getValue(truth_key());
+	if (ta or tb)
+	{
+		TSM_ASSERT("Missing truth value", ta);
+		TSM_ASSERT("Missing truth value", tb);
+		if (ta and tb)
+		{
+			TSM_ASSERT("Truth value miscompare", (*ta)==(*tb));
+
+			if (not ((*ta) == (*tb)))
+			{
+				FloatValuePtr fva = FloatValueCast(ta);
+				FloatValuePtr fvb = FloatValueCast(tb);
+				fprintf(stderr,
+					"Error, truth value miscompare, ma=%18.16g\n"
+					"                               mb=%18.16g\n"
+					"   mdiff=%g ca=%g cb=%g\n",
+					fva->value()[0], fvb->value()[0],
+					fva->value()[0] - fvb->value()[0],
+					fva->value()[1], fvb->value()[1]);
+				fprintf(stderr, "Above is for %s\n\n",
+					a->to_string().c_str());
+			}
+		}
+	}
+}
+
+// ============================================================
+/**
+ * A simple test case that tests the save and restore of
+ * a couple of nodes and a link. Does not test atomtable/atomspace
+ * at all.
+ *
+ * Uses the message-based open/close mechanism, exactly as
+ * the Rocks and Cog StorageNode tests do.
+ */
+void BasicSaveUTest::single_atom_save_restore(std::string id)
+{
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	logger().debug("single_atom_save_restore: create %p", store.get());
+
+	// Open via message-based API (canonical StorageNode pattern)
+	store->setValue(as->add_node(PREDICATE_NODE, "*-open-*"),
+	                createVoidValue());
+	logger().debug("single_atom_save_restore: opened");
+
+	if (!store->connected())
+	{
+		logger().debug("single_atom_save_restore: cannot connect to GPU");
+		TSM_ASSERT("cannot connect to GPU", false);
+		return;
+	}
+	logger().debug("single_atom_save_restore: connected");
+
+	// Create an atom ...
+	Handle a(createNode(SCHEMA_NODE, id + "someNode"));
+	ValuePtr stv(createFloatValue(
+		std::vector<double>({0.55, 0.6})));
+	a->setValue(truth_key(), stv);
+
+	Handle h = a->get_handle();
+	TSM_ASSERT("Bad Handle", nullptr != h);
+
+	// Store the atom ...
+	store->storeAtom(h, true);
+	store->barrier();
+	printf("Done storing single node\n");
+	fflush(stdout);
+
+	// Fetch it back ...
+	std::string nam = id + "someNode";
+	Handle b = createNode(SCHEMA_NODE, nam);
+	logger().debug("single_atom_save_restore: try to get schema=%s",
+		b->to_string().c_str());
+	store->getAtom(b);
+	logger().debug("single_atom_save_restore: Got the schema=%s",
+		b->to_string().c_str());
+	printf("Done fetching single node\n");
+	fflush(stdout);
+
+	// Are they equal ??
+	atomCompare(a, b, "Single node save-restore");
+
+	// Create a second atom, connect it to the first
+	// with a link. Save it, fetch it ... are they equal?
+	Handle a2(createNode(SCHEMA_NODE, id + "otherNode"));
+	store->storeAtom(a2->get_handle(), true);
+
+	HandleSeq hvec;
+	hvec.push_back(a->get_handle());
+	hvec.push_back(a2->get_handle());
+
+	Handle lnk(createLink(hvec, LIST_LINK));
+	store->storeAtom(lnk->get_handle(), true);
+	store->barrier();
+	printf("Done storing single link\n");
+	fflush(stdout);
+
+	Handle hl(createLink(LIST_LINK, a->get_handle(), a2->get_handle()));
+	store->getAtom(hl);
+	atomCompare(lnk, hl, "Single link save-restore");
+	printf("Done fetching single link\n");
+	fflush(stdout);
+
+	// Clean up: erase GPU pools and close via message
+	store->erase();
+	store->setValue(as->add_node(PREDICATE_NODE, "*-close-*"),
+	                createVoidValue());
+}
+
+// ============================================================
+
+void BasicSaveUTest::add_to_table(int idx, AtomSpace *table,
+                                  std::string id)
+{
+	// Create two nodes with truth values ...
+	n1[idx] = createNode(SCHEMA_NODE, id + "fromNode");
+	ValuePtr stv(createFloatValue(
+		std::vector<double>({0.11, 1.0 / (100.0 + idx)})));
+	n1[idx]->setValue(truth_key(), stv);
+	n1[idx] = table->add_atom(n1[idx]);
+	a1[idx] = n1[idx];
+
+	n2[idx] = createNode(SCHEMA_NODE, id + "toNode");
+	ValuePtr stv2(createFloatValue(
+		std::vector<double>({0.22, 1.0 / (200.0 + idx)})));
+	n2[idx]->setValue(truth_key(), stv2);
+	n2[idx] = table->add_atom(n2[idx]);
+	a2[idx] = n2[idx];
+
+	// Create a binary link between them (with truth value).
+	// The Rocks test uses a 4-arity SET_LINK with NumberNode;
+	// GPU pools only support binary LIST_LINK between SchemaNodes.
+	HandleSeq hvec;
+	hvec.push_back(a1[idx]->get_handle());
+	hvec.push_back(a2[idx]->get_handle());
+
+	l[idx] = createLink(hvec, LIST_LINK);
+	ValuePtr stv3(createFloatValue(
+		std::vector<double>({(idx + 1) * 1.5, (idx + 1) * 0.3})));
+	l[idx]->setValue(truth_key(), stv3);
+	l[idx] = table->add_atom(l[idx]);
+	al[idx] = l[idx];
+}
+
+void BasicSaveUTest::check_table(int idx, AtomSpace *table,
+                                 std::string id)
+{
+	Handle hb1 = table->get_atom(Handle(n1[idx]));
+	atomCompare(a1[idx], hb1, "check_table hb1");
+
+	Handle hb2 = table->get_atom(Handle(n2[idx]));
+	atomCompare(a2[idx], hb2, "check_table hb2");
+
+	HandleSeq hvec;
+	hvec.push_back(hb1);
+	hvec.push_back(hb2);
+
+	Handle lb(createLink(hvec, LIST_LINK));
+	Handle hlb = table->get_atom(lb);
+	atomCompare(al[idx], hlb, "check_table hlb");
+}
+
+// ============================================================
+
+void BasicSaveUTest::test_single_atom(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	single_atom_save_restore("aaa ");
+	single_atom_save_restore("bbb ");
+	single_atom_save_restore("ccc ");
+	single_atom_save_restore("ddd ");
+	single_atom_save_restore("eee ");
+	single_atom_save_restore("$$$ ");
+
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+void BasicSaveUTest::test_fresh_atom(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	AtomSpacePtr as = createAtomSpace();
+	Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+
+	if (!store->connected())
+	{
+		logger().debug("test_fresh_atom: cannot connect to GPU");
+		return;
+	}
+
+	Handle ha(createNode(SCHEMA_NODE, "electrical"));
+	Handle hb(createNode(SCHEMA_NODE, "energy"));
+
+	// Store a ListLink with truth value.
+	Handle lf(createLink(LIST_LINK, ha, hb));
+	lf->setValue(truth_key(), createFloatValue(
+		std::vector<double>({0.55, 0.6})));
+	store->storeAtom(lf, true);
+	store->barrier();
+
+	// Fetch it back.
+	Handle hf(createLink(LIST_LINK, ha, hb));
+	store->getAtom(hf);
+	atomCompare(lf, hf, "Fully Fresh");
+
+	store->erase();
+	store->close();
+
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+void BasicSaveUTest::test_table()
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	// Create store in its own AtomSpace (so data AtomSpace is clean)
+	AtomSpacePtr store_as = createAtomSpace();
+	Handle hsn = store_as->add_node(GPU_STORAGE_NODE, std::string(uri));
+	GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+	store->open();
+
+	if (!store->connected())
+	{
+		TSM_ASSERT("cannot connect to GPU", false);
+		return;
+	}
+
+	// Data AtomSpace: create atoms
+	AtomSpacePtr data_as = createAtomSpace();
+	AtomSpace *table1 = data_as.get();
+
+	int idx = 0;
+	add_to_table(idx++, table1, "AA-aa-wow ");
+	add_to_table(idx++, table1, "BB-bb-wow ");
+	add_to_table(idx++, table1, "CC-cc-wow ");
+	add_to_table(idx++, table1, "DD-dd-wow ");
+	add_to_table(idx++, table1, "EE-ee-wow ");
+
+	// Store everything to GPU
+	store->storeAtomSpace(table1);
+	store->barrier();
+	size_t num_stored = table1->get_size();
+	printf("Done storing table; size=%lu\n", num_stored);
+
+	// Load into a fresh AtomSpace from GPU
+	AtomSpacePtr load_as = createAtomSpace();
+	AtomSpace *table2 = load_as.get();
+
+	store->loadAtomSpace(table2);
+	store->barrier();
+	size_t num_fetched = table2->get_size();
+	printf("test_table: loaded %lu atoms from GPU, stored %lu\n",
+	       num_fetched, num_stored);
+
+	// We stored 5 x (2 nodes + 1 link) = 15 atoms.
+	// loadAtomSpace should recreate them all.
+	TSM_ASSERT("Too few atoms loaded", num_fetched >= num_stored);
+
+	// Verify each table row
+	idx = 0;
+	check_table(idx++, table2, "AA-aa-wow ");
+	check_table(idx++, table2, "BB-bb-wow ");
+	check_table(idx++, table2, "CC-cc-wow ");
+	check_table(idx++, table2, "DD-dd-wow ");
+	check_table(idx++, table2, "EE-ee-wow ");
+
+	store->erase();
+	store->close();
+
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+/* ============================= END OF FILE ================= */

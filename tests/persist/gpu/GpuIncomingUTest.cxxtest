@@ -1,0 +1,579 @@
+/*
+ * tests/persist/gpu/GpuIncomingUTest.cxxtest
+ *
+ * Phase 2 tests: fetchIncomingByType, fetchIncomingSet, loadType.
+ * Verifies that the GPU parallel incoming-set scan correctly finds
+ * all pairs referencing a given word.
+ *
+ * Copyright (C) 2025 OpenCog Foundation
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+#include <cstdio>
+#include <cmath>
+
+#include <opencog/atoms/base/Atom.h>
+#include <opencog/atoms/base/Link.h>
+#include <opencog/atoms/base/Node.h>
+#include <opencog/atoms/atom_types/atom_types.h>
+#include <opencog/atoms/value/FloatValue.h>
+#include <opencog/atomspace/AtomSpace.h>
+#include <opencog/persist/gpu/GpuStorageNode.h>
+#include <opencog/persist/gpu-types/atom_types.h>
+
+#include <opencog/util/Logger.h>
+
+#include <cxxtest/TestSuite.h>
+
+using namespace opencog;
+
+// ============================================================
+
+class GpuIncomingUTest : public CxxTest::TestSuite
+{
+private:
+    std::string uri;
+
+    // Helper: create a GPU store, open it, erase it
+    GpuStorageNodePtr make_store(AtomSpacePtr as)
+    {
+        Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string(uri));
+        GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+        store->open();
+        store->erase();
+        return store;
+    }
+
+public:
+    GpuIncomingUTest(void)
+    {
+        logger().set_level(Logger::INFO);
+        logger().set_print_to_stdout_flag(true);
+        logger().set_sync_flag(true);
+
+        uri = "gpu://:";
+    }
+
+    ~GpuIncomingUTest() {}
+
+    void setUp(void) {}
+    void tearDown(void) {}
+
+    void test_incoming_by_type(void);
+    void test_incoming_empty(void);
+    void test_incoming_with_values(void);
+    void test_incoming_both_sides(void);
+    void test_load_type_words(void);
+    void test_load_type_pairs(void);
+    void test_fetch_incoming_set(void);
+    void test_large_incoming(void);
+    void test_incoming_after_store(void);
+    void test_load_atomspace_pairs(void);
+};
+
+// ============================================================
+// Test 1: Store 3 pairs (A-B, A-C, A-D), fetch incoming for A.
+// Should find all 3.
+
+void GpuIncomingUTest::test_incoming_by_type(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    // Store three pairs all sharing word "alpha"
+    Handle alpha(createNode(SCHEMA_NODE, "alpha"));
+    Handle beta(createNode(SCHEMA_NODE, "beta"));
+    Handle gamma(createNode(SCHEMA_NODE, "gamma"));
+    Handle delta(createNode(SCHEMA_NODE, "delta"));
+
+    Handle ab(createLink(LIST_LINK, alpha, beta));
+    Handle ac(createLink(LIST_LINK, alpha, gamma));
+    Handle ad(createLink(LIST_LINK, alpha, delta));
+
+    store->storeAtom(ab, true);
+    store->storeAtom(ac, true);
+    store->storeAtom(ad, true);
+    store->barrier();
+    printf("Stored 3 pairs sharing 'alpha'\n");
+
+    // Fetch incoming set for alpha in a fresh AtomSpace
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle alpha2 = as2->add_node(SCHEMA_NODE, "alpha");
+    store->fetchIncomingByType(as2.get(), alpha2, LIST_LINK);
+
+    // Count links in the new AtomSpace
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("Found %zu incoming links for alpha\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find 3 incoming links", links.size(), 3);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 2: Fetch incoming for word with no pairs. Returns empty.
+
+void GpuIncomingUTest::test_incoming_empty(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    // Store a lone word (no pairs)
+    Handle alone(createNode(SCHEMA_NODE, "alone"));
+    store->storeAtom(alone, true);
+    store->barrier();
+
+    // Also store a pair between OTHER words so pool isn't empty
+    Handle x(createNode(SCHEMA_NODE, "x"));
+    Handle y(createNode(SCHEMA_NODE, "y"));
+    Handle xy(createLink(LIST_LINK, x, y));
+    store->storeAtom(xy, true);
+    store->barrier();
+
+    // Fetch incoming for "alone"
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle alone2 = as2->add_node(SCHEMA_NODE, "alone");
+    store->fetchIncomingByType(as2.get(), alone2, LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("Found %zu incoming links for 'alone'\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find 0 incoming links", links.size(), 0);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 3: Verify fetched pairs have correct counts and MI.
+
+void GpuIncomingUTest::test_incoming_with_values(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    Handle a(createNode(SCHEMA_NODE, "wordA"));
+    Handle b(createNode(SCHEMA_NODE, "wordB"));
+    Handle lnk(createLink(LIST_LINK, a, b));
+
+    double expected_count = 42.5;
+    double expected_mi = 3.14159;
+    lnk->setValue(truth_key(),
+        createFloatValue(std::vector<double>({expected_count, expected_mi})));
+
+    store->storeAtom(lnk, true);
+    store->barrier();
+    printf("Stored pair with count=%g mi=%g\n", expected_count, expected_mi);
+
+    // Fetch incoming for wordA
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle a2 = as2->add_node(SCHEMA_NODE, "wordA");
+    store->fetchIncomingByType(as2.get(), a2, LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    TSM_ASSERT_EQUALS("Should find 1 link", links.size(), 1);
+
+    if (links.size() == 1)
+    {
+        ValuePtr tv = links[0]->getValue(truth_key());
+        TSM_ASSERT("Should have truth value", tv != nullptr);
+
+        if (tv)
+        {
+            FloatValuePtr fv = FloatValueCast(tv);
+            TSM_ASSERT("Should be FloatValue", fv != nullptr);
+
+            if (fv and fv->value().size() >= 2)
+            {
+                TSM_ASSERT_DELTA("Count mismatch",
+                    fv->value()[0], expected_count, 1e-10);
+                TSM_ASSERT_DELTA("MI mismatch",
+                    fv->value()[1], expected_mi, 1e-10);
+                printf("Values match: count=%g mi=%g\n",
+                    fv->value()[0], fv->value()[1]);
+            }
+        }
+    }
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 4: Word appears as both word_a and word_b. Should find all.
+
+void GpuIncomingUTest::test_incoming_both_sides(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    // "center" appears on both sides of different pairs
+    Handle center(createNode(SCHEMA_NODE, "center"));
+    Handle left1(createNode(SCHEMA_NODE, "left1"));
+    Handle left2(createNode(SCHEMA_NODE, "left2"));
+    Handle right1(createNode(SCHEMA_NODE, "right1"));
+
+    // center is word_a (or word_b depending on canonical ordering)
+    Handle l1(createLink(LIST_LINK, left1, center));
+    Handle l2(createLink(LIST_LINK, left2, center));
+    Handle l3(createLink(LIST_LINK, center, right1));
+
+    store->storeAtom(l1, true);
+    store->storeAtom(l2, true);
+    store->storeAtom(l3, true);
+    store->barrier();
+    printf("Stored 3 pairs with 'center' on both sides\n");
+
+    // Fetch incoming for center
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle c2 = as2->add_node(SCHEMA_NODE, "center");
+    store->fetchIncomingByType(as2.get(), c2, LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("Found %zu incoming links for 'center'\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find 3 incoming links", links.size(), 3);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 5: Store 50 words, loadType(SCHEMA_NODE), verify all present.
+
+void GpuIncomingUTest::test_load_type_words(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    const int N = 50;
+    for (int i = 0; i < N; i++)
+    {
+        std::string name = "loadWord_" + std::to_string(i);
+        Handle h(createNode(SCHEMA_NODE, name));
+        double count = (double)(i + 1);
+        double marginal = count * 0.5;
+        h->setValue(truth_key(),
+            createFloatValue(std::vector<double>({count, marginal})));
+        store->storeAtom(h, false);
+    }
+    store->barrier();
+    printf("Stored %d words\n", N);
+
+    // Load into fresh AtomSpace
+    AtomSpacePtr as2 = createAtomSpace();
+    store->loadType(as2.get(), SCHEMA_NODE);
+
+    HandleSeq nodes;
+    as2->get_handles_by_type(nodes, SCHEMA_NODE, true);
+    printf("loadType found %zu nodes\n", nodes.size());
+
+    // Should find at least N nodes (may also include the
+    // GpuStorageNode itself, which is SCHEMA_NODE subtype)
+    TSM_ASSERT_LESS_THAN_EQUALS("Should find at least N words",
+        (size_t)N, nodes.size());
+
+    // Verify values for a few
+    for (int i = 0; i < N; i++)
+    {
+        std::string name = "loadWord_" + std::to_string(i);
+        Handle h = as2->get_node(SCHEMA_NODE, std::string(name));
+        if (nullptr == h) continue;
+
+        ValuePtr tv = h->getValue(truth_key());
+        if (tv)
+        {
+            FloatValuePtr fv = FloatValueCast(tv);
+            if (fv and fv->value().size() >= 2)
+            {
+                double expected_count = (double)(i + 1);
+                TSM_ASSERT_DELTA("Count mismatch",
+                    fv->value()[0], expected_count, 1e-10);
+            }
+        }
+    }
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 6: Store 20 pairs, loadType(LIST_LINK), verify all present
+// with values.
+
+void GpuIncomingUTest::test_load_type_pairs(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    const int N = 20;
+    for (int i = 0; i < N; i++)
+    {
+        std::string na = "pairLeft_" + std::to_string(i);
+        std::string nb = "pairRight_" + std::to_string(i);
+        Handle ha(createNode(SCHEMA_NODE, na));
+        Handle hb(createNode(SCHEMA_NODE, nb));
+        Handle lnk(createLink(LIST_LINK, ha, hb));
+
+        double count = (double)(i + 1) * 10.0;
+        double mi = (double)(i + 1) * 0.25;
+        lnk->setValue(truth_key(),
+            createFloatValue(std::vector<double>({count, mi})));
+
+        store->storeAtom(lnk, false);
+    }
+    store->barrier();
+    printf("Stored %d pairs\n", N);
+
+    // Load pairs into fresh AtomSpace
+    AtomSpacePtr as2 = createAtomSpace();
+    store->loadType(as2.get(), LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("loadType found %zu links\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find N pairs", links.size(), (size_t)N);
+
+    // Verify at least one has correct values
+    int verified = 0;
+    for (const Handle& lnk : links)
+    {
+        ValuePtr tv = lnk->getValue(truth_key());
+        if (tv)
+        {
+            FloatValuePtr fv = FloatValueCast(tv);
+            if (fv and fv->value().size() >= 2)
+            {
+                // Values should be non-zero
+                TSM_ASSERT("Count should be positive", fv->value()[0] > 0);
+                verified++;
+            }
+        }
+    }
+    printf("Verified values on %d / %zu pairs\n", verified, links.size());
+    TSM_ASSERT_EQUALS("All pairs should have values", verified, N);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 7: Same as test 1 but via fetchIncomingSet (no type filter).
+
+void GpuIncomingUTest::test_fetch_incoming_set(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    Handle a(createNode(SCHEMA_NODE, "hub"));
+    Handle b(createNode(SCHEMA_NODE, "spoke1"));
+    Handle c(createNode(SCHEMA_NODE, "spoke2"));
+
+    Handle ab(createLink(LIST_LINK, a, b));
+    Handle ac(createLink(LIST_LINK, a, c));
+
+    store->storeAtom(ab, true);
+    store->storeAtom(ac, true);
+    store->barrier();
+    printf("Stored 2 pairs sharing 'hub'\n");
+
+    // Use fetchIncomingSet (no type filter)
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle a2 = as2->add_node(SCHEMA_NODE, "hub");
+    store->fetchIncomingSet(as2.get(), a2);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("fetchIncomingSet found %zu links\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find 2 incoming links", links.size(), 2);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 8: Store 1000 pairs for one word, fetch incoming.
+// Verify all 1000 found.
+
+void GpuIncomingUTest::test_large_incoming(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    const int N = 1000;
+    Handle hub(createNode(SCHEMA_NODE, "megahub"));
+    store->storeAtom(hub, true);
+
+    for (int i = 0; i < N; i++)
+    {
+        std::string name = "spoke_" + std::to_string(i);
+        Handle spoke(createNode(SCHEMA_NODE, name));
+        Handle lnk(createLink(LIST_LINK, hub, spoke));
+        store->storeAtom(lnk, false);
+    }
+    store->barrier();
+    printf("Stored %d pairs sharing 'megahub'\n", N);
+
+    // Fetch incoming
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle hub2 = as2->add_node(SCHEMA_NODE, "megahub");
+    store->fetchIncomingByType(as2.get(), hub2, LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("Found %zu incoming links for megahub\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find all N links", links.size(), (size_t)N);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 9: Store new pair after initial fetch, re-fetch, find it.
+
+void GpuIncomingUTest::test_incoming_after_store(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    Handle a(createNode(SCHEMA_NODE, "evolving"));
+    Handle b(createNode(SCHEMA_NODE, "partner1"));
+    Handle ab(createLink(LIST_LINK, a, b));
+    store->storeAtom(ab, true);
+    store->barrier();
+
+    // First fetch: should find 1
+    AtomSpacePtr as2 = createAtomSpace();
+    Handle a2 = as2->add_node(SCHEMA_NODE, "evolving");
+    store->fetchIncomingByType(as2.get(), a2, LIST_LINK);
+
+    HandleSeq links1;
+    as2->get_handles_by_type(links1, LIST_LINK, true);
+    printf("First fetch: %zu links\n", links1.size());
+    TSM_ASSERT_EQUALS("Should find 1 link initially", links1.size(), 1);
+
+    // Store another pair
+    Handle c(createNode(SCHEMA_NODE, "partner2"));
+    Handle ac(createLink(LIST_LINK, a, c));
+    store->storeAtom(ac, true);
+    store->barrier();
+
+    // Second fetch: should find 2
+    AtomSpacePtr as3 = createAtomSpace();
+    Handle a3 = as3->add_node(SCHEMA_NODE, "evolving");
+    store->fetchIncomingByType(as3.get(), a3, LIST_LINK);
+
+    HandleSeq links2;
+    as3->get_handles_by_type(links2, LIST_LINK, true);
+    printf("Second fetch: %zu links\n", links2.size());
+    TSM_ASSERT_EQUALS("Should find 2 links after adding", links2.size(), 2);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Test 10: loadAtomSpace loads both words AND pairs
+
+void GpuIncomingUTest::test_load_atomspace_pairs(void)
+{
+    logger().info("BEGIN TEST: %s", __FUNCTION__);
+
+    AtomSpacePtr as = createAtomSpace();
+    GpuStorageNodePtr store = make_store(as);
+
+    // Store some words and pairs
+    Handle a(createNode(SCHEMA_NODE, "loadAll_A"));
+    Handle b(createNode(SCHEMA_NODE, "loadAll_B"));
+    Handle c(createNode(SCHEMA_NODE, "loadAll_C"));
+
+    a->setValue(truth_key(),
+        createFloatValue(std::vector<double>({1.0, 0.1})));
+    b->setValue(truth_key(),
+        createFloatValue(std::vector<double>({2.0, 0.2})));
+
+    Handle ab(createLink(LIST_LINK, a, b));
+    ab->setValue(truth_key(),
+        createFloatValue(std::vector<double>({10.0, 5.5})));
+
+    Handle ac(createLink(LIST_LINK, a, c));
+    ac->setValue(truth_key(),
+        createFloatValue(std::vector<double>({20.0, 7.7})));
+
+    store->storeAtom(ab, true);
+    store->storeAtom(ac, true);
+    store->barrier();
+    printf("Stored 3 nodes + 2 pairs\n");
+
+    // Load words only (existing loadAtomSpace)
+    AtomSpacePtr as2 = createAtomSpace();
+    store->loadAtomSpace(as2.get());
+
+    HandleSeq nodes;
+    as2->get_handles_by_type(nodes, SCHEMA_NODE, true);
+    printf("loadAtomSpace found %zu nodes\n", nodes.size());
+
+    TSM_ASSERT_LESS_THAN_EQUALS("Should find at least 3 nodes",
+        (size_t)3, nodes.size());
+
+    // Now also load pairs via loadType
+    store->loadType(as2.get(), LIST_LINK);
+
+    HandleSeq links;
+    as2->get_handles_by_type(links, LIST_LINK, true);
+    printf("loadType(LIST_LINK) found %zu pairs\n", links.size());
+
+    TSM_ASSERT_EQUALS("Should find 2 pairs", links.size(), 2);
+
+    store->erase();
+    store->close();
+
+    logger().info("END TEST: %s", __FUNCTION__);
+}
+
+/* ============================= END OF FILE ================= */

@@ -10,6 +10,7 @@
 SET(OPENCL_KERNEL_FILES
 	gpu-hashtable.cl
 	gpu-atomspace.cl
+	gpu-incoming.cl
 	gpu-mi.cl
 	gpu-cosine.cl
 	gpu-counting.cl

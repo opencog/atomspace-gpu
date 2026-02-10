@@ -55,10 +55,23 @@ private:
 	std::unique_ptr<GpuBackend> _backend;
 	bool _connected;
 
-	// CPU-side name->hash mapping (GPU stores hashes, CPU knows strings)
+	// CPU-side (type,name)->hash mapping (GPU stores hashes, CPU knows strings)
+	struct TypedName {
+		Type type;
+		std::string name;
+		bool operator==(const TypedName& o) const {
+			return type == o.type && name == o.name;
+		}
+	};
+	struct TypedNameHash {
+		size_t operator()(const TypedName& tn) const {
+			return std::hash<std::string>()(tn.name)
+			     ^ (size_t(tn.type) * 0x9E3779B97F4A7C15ULL);
+		}
+	};
 	std::mutex _name_mtx;
-	std::unordered_map<std::string, uint64_t> _name_to_hash;
-	std::unordered_map<uint64_t, std::string> _hash_to_name;
+	std::unordered_map<TypedName, uint64_t, TypedNameHash> _name_to_hash;
+	std::unordered_map<uint64_t, TypedName> _hash_to_name;
 
 	// Atom->GPU-index mapping for Values
 	struct ValueSlot {
@@ -71,10 +84,11 @@ private:
 	// Internal helpers
 	void parse_uri(void);
 
-	uint64_t name_hash(const std::string& name);
-	uint32_t store_word(const std::string& name);
-	uint32_t store_pair(uint32_t word_a, uint32_t word_b);
-	uint32_t lookup_word(const std::string& name);
+	uint64_t name_hash(Type t, const std::string& name);
+	uint32_t store_word(Type t, const std::string& name);
+	uint32_t store_pair(uint32_t word_a, uint32_t word_b,
+	                    Type link_type);
+	uint32_t lookup_word(Type t, const std::string& name);
 	uint32_t lookup_pair(uint32_t word_a, uint32_t word_b);
 
 	void store_node_values(const Handle&, uint32_t pool_idx);

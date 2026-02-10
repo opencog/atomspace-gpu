@@ -10,3 +10,6 @@ LINK_LIBRARIES(
 )
 
 ADD_CXXTEST(GpuStorageNodeUTest)
+ADD_CXXTEST(GpuIncomingUTest)
+ADD_CXXTEST(BasicSaveUTest)
+ADD_CXXTEST(GpuBulkUTest)
