@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include("@CMAKE_INSTALL_PREFIX@/lib/cmake/AtomSpaceGPU/AtomSpaceGPUTargets.cmake")
+
+link_directories(
+	"@CMAKE_INSTALL_PREFIX@/lib/opencog/"
+)
+set(ATOMSPACE_GPU_LIBRARIES
+	persist-gpu
+)
+
+set(ATOMSPACE_GPU_DATA_DIR "@CMAKE_INSTALL_PREFIX@/share/opencog")
+set(ATOMSPACE_GPU_INCLUDE_DIR "@CMAKE_INSTALL_PREFIX@/include/")
+set(ATOMSPACE_GPU_VERSION "@PROJECT_VERSION@")
+set(ATOMSPACE_GPU_FOUND 1)
