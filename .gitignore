@@ -1,1 +1,13 @@
 build/
+*.o
+*.so
+*.a
+*.pyc
+__pycache__/
+cscope.files
+cscope.out
+tags
+TAGS
+*.swp
+*.swo
+*~

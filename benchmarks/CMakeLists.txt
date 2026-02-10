@@ -1,0 +1,33 @@
+#
+# GPU AtomSpace benchmarks.
+#
+
+IF (HAVE_CUDA)
+	SET(CUDA_BENCHMARKS
+		bench-kernels
+		bench-pipeline
+		bench-corpus
+		bench-corpus-ck
+		bench-mi-comparison
+	)
+
+	FOREACH(BENCH_NAME ${CUDA_BENCHMARKS})
+		ADD_EXECUTABLE(${BENCH_NAME} ${BENCH_NAME}.cu)
+		SET_TARGET_PROPERTIES(${BENCH_NAME} PROPERTIES
+			CUDA_SEPARABLE_COMPILATION ON
+			CUDA_ARCHITECTURES "50;72;75;86;89"
+		)
+		TARGET_INCLUDE_DIRECTORIES(${BENCH_NAME} PRIVATE
+			${PROJECT_SOURCE_DIR}
+			${PROJECT_SOURCE_DIR}/opencog/gpu)
+		TARGET_LINK_LIBRARIES(${BENCH_NAME} gpu-kernels)
+	ENDFOREACH()
+ENDIF (HAVE_CUDA)
+
+IF (HAVE_OPENCL)
+	ADD_EXECUTABLE(bench-corpus-feeder bench-corpus-feeder.c)
+	TARGET_LINK_LIBRARIES(bench-corpus-feeder OpenCL::OpenCL)
+	TARGET_INCLUDE_DIRECTORIES(bench-corpus-feeder PRIVATE
+		${PROJECT_SOURCE_DIR}
+		${PROJECT_SOURCE_DIR}/opencog/gpu)
+ENDIF (HAVE_OPENCL)

@@ -1,60 +1,48 @@
 
-AtomSpace GPU Storage Backend
+AtomSpace GPU
 =====================================
 
-A GPU-backed [StorageNode](https://wiki.opencog.org/w/StorageNode)
-for the [OpenCog AtomSpace](https://github.com/opencog/atomspace).
-Allows atoms and values to be stored in GPU VRAM for high-throughput
-GPU-resident computation.
+An [AtomSpace](https://github.com/opencog/atomspace) on the GPU.
 
-Same API as [RocksStorageNode](https://github.com/opencog/atomspace-rocks)
-(disk) and [CogStorageNode](https://github.com/opencog/atomspace-cog)
-(network), but backed by GPU SoA (Structure-of-Arrays) pools.
+Stores atoms as flattened Structure-of-Arrays (SoA) in VRAM so thousands
+of GPU threads can operate on them simultaneously. Kernels compute MI,
+cosine similarity, clustering, connected components, and the full
+learning loop (count → MI → cluster → grammar) directly on the GPU.
+
+[GpuStorageNode](https://wiki.opencog.org/w/StorageNode) is the bridge
+that sends atoms from the CPU to the AtomSpace on the GPU and fetches
+results back. Same API as
+[RocksStorageNode](https://github.com/opencog/atomspace-rocks) (disk)
+and [CogStorageNode](https://github.com/opencog/atomspace-cog) (network).
 
 Supports **CUDA** (preferred for NVIDIA GPUs) and **OpenCL** (fallback
-for AMD/Intel). At least one must be available at build time. Backend
-is selected at runtime based on URI and hardware availability.
+for AMD/Intel). At least one must be available at build time.
 
 Architecture
 ------------
 ```
-CPU AtomSpace
-    |
-    +-- RocksStorageNode  -> disk (RocksDB)
-    +-- CogStorageNode    -> network (CogServer)
-    +-- GpuStorageNode    -> GPU VRAM (CUDA or OpenCL)
-            |
-            +-- GpuBackend (abstract interface)
-            |       |
-            |       +-- CudaBackend    (preferred, NVIDIA)
-            |       +-- OpenCLBackend  (fallback, AMD/Intel/NVIDIA)
-            |
-            +-- WordPool      128K nodes (name_hash, count, marginal, class_id)
-            +-- PairPool      4M binary links (word_a, word_b, count, mi, flags)
-            +-- SectionPool   1M sections (word, disjunct_hash, count)
+CPU (control plane)          GPU (the AtomSpace)
+  Scheme / C++ code            SoA pools + kernels
+        │                           │
+        ├── storeAtom() ──────────→ │  receives atom
+        ├── getAtom()   ←────────── │  returns results
+        └── runQuery()  ──────────→ │  runs computation
 ```
 
-Each pool uses a lock-free GPU hash table for O(1) lookup and a bump
-allocator for slot allocation. CUDA backend uses device memory with
-managed staging buffers; OpenCL backend uses cl::Buffer with JIT
-kernel compilation.
+The repo has two layers with different dependencies:
 
-URI Format
-----------
-```
-gpu://:              first available device (CUDA preferred)
-gpu://NVIDIA:RTX     NVIDIA device containing "RTX" (auto backend)
-gpu://cuda::         force CUDA backend, any device
-gpu://opencl::       force OpenCL backend, any device
-gpu://opencl:Intel:  OpenCL on first Intel device
-```
+- **`opencog/gpu/`** -- The GPU AtomSpace itself. Fully standalone: pure
+  CUDA and OpenCL with zero OpenCog dependencies. Can be built and used
+  independently for any GPU computing project.
+- **`opencog/persist/gpu/`** -- The GpuStorageNode bridge (~350 lines).
+  Implements the StorageNode API so the CPU AtomSpace can send atoms to
+  the GPU. Requires [CogUtil](https://github.com/opencog/cogutil),
+  [AtomSpace](https://github.com/opencog/atomspace), and
+  [AtomSpace-Storage](https://github.com/opencog/atomspace-storage).
 
 Building
 --------
-Prerequisites: [CogUtil](https://github.com/opencog/cogutil),
-[AtomSpace](https://github.com/opencog/atomspace),
-[AtomSpace-Storage](https://github.com/opencog/atomspace-storage),
-and at least one of:
+Requires at least one of:
 - **CUDA Toolkit** (11.0+) for NVIDIA GPUs
 - **OpenCL** (1.2+ runtime and headers) for AMD/Intel/NVIDIA GPUs
 
@@ -66,81 +54,44 @@ make test
 sudo make install
 ```
 
-CMake will auto-detect available backends. To force a specific backend:
-```bash
-cmake .. -DHAVE_CUDA=OFF        # OpenCL only
-cmake .. -DHAVE_OPENCL=OFF      # CUDA only (not recommended)
-```
-
-Usage (C++)
------------
+Usage
+-----
 ```cpp
 #include <opencog/persist/gpu/GpuStorageNode.h>
 
-AtomSpacePtr as = createAtomSpace();
 Handle hsn = as->add_node(GPU_STORAGE_NODE, std::string("gpu://:"));
 GpuStorageNodePtr store = GpuStorageNodeCast(hsn);
+store->open();
 
-store->open();   // Selects CUDA if available, else OpenCL
-
-// Store a node with values
-Handle a(createNode(SCHEMA_NODE, "someWord"));
+Handle a(createNode(CONCEPT_NODE, "someWord"));
 a->setValue(truth_key(), createFloatValue({42.0, 3.7}));
 store->storeAtom(a, true);
 store->barrier();
 
-// Fetch it back
-Handle b(createNode(SCHEMA_NODE, "someWord"));
-store->getAtom(b);
-// b now has the same FloatValue
+Handle b(createNode(CONCEPT_NODE, "someWord"));
+store->getAtom(b);  // b now has the same FloatValue
 
 store->close();
 ```
 
-Usage (Scheme)
---------------
+Or from Scheme:
 ```scheme
 (use-modules (opencog) (opencog persist) (opencog persist-gpu))
-
 (define gpu (GpuStorageNode "gpu://:"))
 (cog-open gpu)
-
-(define a (Concept "someWord"))
-(cog-set-value! a (Predicate "*-TruthValueKey-*")
-    (FloatValue 42.0 3.7))
-(store-atom a)
-(barrier gpu)
-
-; Fetch back
-(define b (Concept "someWord"))
-(fetch-atom b)
-
+(store-atom (Concept "someWord"))
+(fetch-atom (Concept "someWord"))
 (cog-close gpu)
 ```
 
-GPU Memory Usage
-----------------
-| Pool     | Capacity | Hash Table | GPU Memory |
-|----------|----------|------------|------------|
-| Words    | 128K     | 256K       | ~4 MB      |
-| Pairs    | 4M       | 8M         | ~160 MB    |
-| Sections | 1M       | 2M         | ~40 MB     |
-| **Total** |         |            | **~204 MB** |
-
 Phases
 ------
-- **Phase 1** (complete): Store/fetch round-trip. 8/8 tests pass.
+- **Phase 1** (complete): Store/fetch round-trip. 13/13 tests pass.
 - **Phase 2** (planned): `runQuery()` -- execute Atomese expressions on GPU.
 - **Phase 3** (planned): JIT compilation -- fused kernels from AST.
 
 Known Limitations
 -----------------
 - GPU storage is **volatile** -- data is lost when the connection closes.
-  Use RocksStorageNode for persistence.
-- Only `truth_key()` values are stored. Other value keys are silently
-  ignored (GPU has fixed SoA layout).
-- Only binary links map to the pair pool. Higher-arity links store
-  their outgoing nodes but not link-level values.
+- Only `truth_key()` values are stored (GPU has fixed SoA layout).
 - CUDA backend requires Compute Capability 5.0+ (Maxwell or newer).
-- OpenCL backend requires `enqueueWriteBuffer` with `CL_TRUE` (blocking)
-  when the host buffer goes out of scope immediately.

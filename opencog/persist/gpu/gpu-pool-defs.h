@@ -12,7 +12,13 @@
 #ifndef _OPENCOG_GPU_POOL_DEFS_H
 #define _OPENCOG_GPU_POOL_DEFS_H
 
-// Pool capacity defaults (can be overridden at compile time)
+// Pool capacity defaults (can be overridden at compile time).
+//
+// GPU memory usage at default capacities:
+//   WordPool     128K slots, 256K hash table  ~  4 MB
+//   PairPool       4M slots,   8M hash table  ~160 MB
+//   SectionPool    1M slots,   2M hash table  ~ 40 MB
+//   Total                                     ~204 MB
 #ifndef GPU_WORD_CAPACITY
 #define GPU_WORD_CAPACITY       131072    // 128K words
 #endif

@@ -61,11 +61,3 @@ INSTALL (FILES ${GPU_INSTALL_HEADERS}
 	DESTINATION "include/opencog/persist/gpu"
 )
 
-# Install OpenCL kernel files (needed at runtime for JIT compilation)
-IF (HAVE_OPENCL)
-	INSTALL (FILES
-		gpu-hashtable.cl
-		gpu-atomspace.cl
-		DESTINATION "share/opencog/opencl/gpu"
-	)
-ENDIF (HAVE_OPENCL)

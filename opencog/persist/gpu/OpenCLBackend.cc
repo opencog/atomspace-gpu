@@ -85,9 +85,9 @@ void OpenCLBackend::compile_kernels()
 		"/usr/share/opencog/opencl/gpu/",
 	};
 
-	search_paths.push_back("opencog/persist/gpu/");
-	search_paths.push_back("../opencog/persist/gpu/");
-	search_paths.push_back("../../opencog/persist/gpu/");
+	search_paths.push_back("opencog/gpu/");
+	search_paths.push_back("../opencog/gpu/");
+	search_paths.push_back("../../opencog/gpu/");
 
 	for (const auto& prefix : search_paths)
 	{

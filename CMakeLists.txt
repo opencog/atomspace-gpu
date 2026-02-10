@@ -1,5 +1,5 @@
 #
-# Master AtomSpace GPU Storage Backend CMake file.
+# Master AtomSpace GPU CMake file.
 #
 # General organization:
 # -- check for different compilers, OS'es
@@ -139,6 +139,7 @@ INCLUDE(OpenCogCython)
 
 ADD_SUBDIRECTORY(cmake)
 ADD_SUBDIRECTORY(opencog)
+ADD_SUBDIRECTORY(benchmarks)
 
 INCLUDE(OpenCogTestOptions)
 OPENCOG_SETUP_TESTING()
@@ -166,7 +167,7 @@ SET(CPACK_GENERATOR "DEB")
 SET(CPACK_PACKAGE_CONTACT "opencog@googlegroups.com")
 SET(CPACK_PACKAGE_DESCRIPTION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
 SET(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/packages")
-SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The AtomSpace GPU Storage Backend (CUDA + OpenCL)")
+SET(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The AtomSpace GPU (CUDA + OpenCL)")
 SET(CPACK_PACKAGE_NAME "atomspace-gpu-dev")
 SET(CPACK_PACKAGE_VENDOR "opencog.org")
 SET(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}-${UTC_DATE}")
@@ -196,8 +197,8 @@ FIND_PACKAGE(Doxygen)
 # ===================================================================
 # Show a summary of what we found, what we will do.
 
-SUMMARY_ADD("CUDA Backend"   "CUDA GPU StorageNode"   HAVE_CUDA)
-SUMMARY_ADD("OpenCL Backend" "OpenCL GPU StorageNode"  HAVE_OPENCL)
+SUMMARY_ADD("CUDA Backend"   "CUDA GPU AtomSpace"   HAVE_CUDA)
+SUMMARY_ADD("OpenCL Backend" "OpenCL GPU AtomSpace"  HAVE_OPENCL)
 SUMMARY_ADD("Doxygen"        "Code documentation" DOXYGEN_FOUND)
 SUMMARY_ADD("Unit tests"     "Unit tests" CXXTEST_FOUND)
 

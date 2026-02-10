@@ -2,6 +2,7 @@
 # This declaration must happen before subdirectory traversal.
 DECLARE_GUILE_CONFIG_TARGET(SCM_CONFIG "opencog gpu-config" "OPENCOG_TEST")
 
+ADD_SUBDIRECTORY (gpu)
 ADD_SUBDIRECTORY (persist)
 
 # ------------------------------------------------------------------
