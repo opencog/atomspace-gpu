@@ -1,3 +1,4 @@
+**warning this is curently an ai-generated experiment so as a result should be considered slop until otherwise proven**
 
 AtomSpace GPU
 =====================================
