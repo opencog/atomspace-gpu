@@ -2,5 +2,3 @@
 // Script for generating the GpuStorageNode atom type.
 //
 GPU_STORAGE_NODE <- STORAGE_NODE
-
-// That's all folks!  Nothing more is needed here!

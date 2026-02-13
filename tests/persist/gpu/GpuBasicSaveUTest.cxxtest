@@ -1,0 +1,282 @@
+/*
+ * tests/persist/gpu/GpuBasicSaveUTest.cxxtest
+ *
+ * Basic save/restore test for GpuStorageNode (Step 3).
+ * Verifies that the BackingStore wrapper correctly delegates
+ * atom storage to the GPU atom table.
+ *
+ * Tests:
+ *   1. Store individual nodes and links, verify via GPU fetch.
+ *   2. Round-trip: storeAtomSpace → loadAtomSpace into fresh AS.
+ *
+ * Copyright (C) 2026 OpenCog Foundation
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+#include <cstdio>
+#include <cstring>
+
+#include <opencog/atoms/base/Atom.h>
+#include <opencog/atoms/base/Link.h>
+#include <opencog/atoms/base/Node.h>
+#include <opencog/atoms/atom_types/atom_types.h>
+#include <opencog/atomspace/AtomSpace.h>
+#include <opencog/persist/gpu/GpuStorageNode.h>
+#include <opencog/persist/gpu/GpuAtomTable.h>
+#include <opencog/persist/gpu-types/atom_types.h>
+
+#include <opencog/util/Logger.h>
+
+using namespace opencog;
+
+class GpuBasicSaveUTest : public CxxTest::TestSuite
+{
+public:
+
+	GpuBasicSaveUTest(void)
+	{
+		logger().set_level(Logger::INFO);
+		logger().set_print_to_stdout_flag(true);
+	}
+
+	~GpuBasicSaveUTest()
+	{
+		if (!CxxTest::TestTracker::tracker().suiteFailed())
+			std::remove(logger().get_filename().c_str());
+	}
+
+	void test_open_close(void);
+	void test_store_nodes(void);
+	void test_store_link(void);
+	void test_roundtrip(void);
+};
+
+// ============================================================
+// Test that open/close/connected work correctly.
+
+void GpuBasicSaveUTest::test_open_close(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	GpuStorageNode* store = new GpuStorageNode(GPU_STORAGE_NODE, "gpu://test");
+
+	TSM_ASSERT("Should not be connected before open", !store->connected());
+
+	store->open();
+	TSM_ASSERT("Should be connected after open", store->connected());
+
+	// Double-open should be safe.
+	store->open();
+	TSM_ASSERT("Still connected after double open", store->connected());
+
+	store->close();
+	TSM_ASSERT("Should not be connected after close", !store->connected());
+
+	delete store;
+
+	printf("test_open_close: PASSED\n");
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Store nodes through BackingStore, verify via GPU fetch.
+
+void GpuBasicSaveUTest::test_store_nodes(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	GpuStorageNode* store = new GpuStorageNode(GPU_STORAGE_NODE, "gpu://test");
+	store->open();
+	TSM_ASSERT("Not connected", store->connected());
+
+	// Create atoms (not in any AtomSpace — raw handles).
+	Handle cat(createNode(CONCEPT_NODE, "cat"));
+	Handle dog(createNode(CONCEPT_NODE, "dog"));
+	Handle isa(createNode(PREDICATE_NODE, "is-a"));
+
+	// Store through BackingStore API.
+	store->storeAtom(cat, true);
+	store->storeAtom(dog, true);
+	store->storeAtom(isa, true);
+	store->barrier();
+
+	// Verify GPU table has 3 atoms.
+	const GpuAtomTable& t = store->gpu_table();
+	TSM_ASSERT_EQUALS("Expected 3 atoms", t.atom_count, 3u);
+
+	// Fetch slot 0 from GPU, verify it's "cat".
+	{
+		uint16_t type;
+		char name_buf[256];
+		uint16_t name_len = sizeof(name_buf);
+		int rc = gpu_fetch_node(&t, 0, &type, name_buf, &name_len);
+		TSM_ASSERT_EQUALS("Fetch node 0 failed", rc, 0);
+		TSM_ASSERT_EQUALS("Type mismatch slot 0", type, (uint16_t)CONCEPT_NODE);
+		TSM_ASSERT_EQUALS("Name length mismatch", name_len, 3u);
+		TSM_ASSERT("Name mismatch slot 0", memcmp(name_buf, "cat", 3) == 0);
+	}
+
+	// Fetch slot 1 — "dog".
+	{
+		uint16_t type;
+		char name_buf[256];
+		uint16_t name_len = sizeof(name_buf);
+		int rc = gpu_fetch_node(&t, 1, &type, name_buf, &name_len);
+		TSM_ASSERT_EQUALS("Fetch node 1 failed", rc, 0);
+		TSM_ASSERT_EQUALS("Type mismatch slot 1", type, (uint16_t)CONCEPT_NODE);
+		TSM_ASSERT_EQUALS("Name length mismatch", name_len, 3u);
+		TSM_ASSERT("Name mismatch slot 1", memcmp(name_buf, "dog", 3) == 0);
+	}
+
+	// Fetch slot 2 — "is-a" (PredicateNode).
+	{
+		uint16_t type;
+		char name_buf[256];
+		uint16_t name_len = sizeof(name_buf);
+		int rc = gpu_fetch_node(&t, 2, &type, name_buf, &name_len);
+		TSM_ASSERT_EQUALS("Fetch node 2 failed", rc, 0);
+		TSM_ASSERT_EQUALS("Type mismatch slot 2", type, (uint16_t)PREDICATE_NODE);
+		TSM_ASSERT_EQUALS("Name length mismatch", name_len, 4u);
+		TSM_ASSERT("Name mismatch slot 2", memcmp(name_buf, "is-a", 4) == 0);
+	}
+
+	// Storing the same atom again should be a no-op.
+	store->storeAtom(cat, true);
+	TSM_ASSERT_EQUALS("Duplicate store changed count", t.atom_count, 3u);
+
+	store->close();
+	delete store;
+
+	printf("test_store_nodes: PASSED\n");
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Store a link (with outgoing atoms), verify GPU data.
+
+void GpuBasicSaveUTest::test_store_link(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	GpuStorageNode* store = new GpuStorageNode(GPU_STORAGE_NODE, "gpu://test");
+	store->open();
+
+	Handle cat(createNode(CONCEPT_NODE, "cat"));
+	Handle dog(createNode(CONCEPT_NODE, "dog"));
+	Handle lnk(createLink(LIST_LINK, cat, dog));
+
+	// storeAtom on the link should recursively store cat and dog first.
+	store->storeAtom(lnk, true);
+	store->barrier();
+
+	const GpuAtomTable& t = store->gpu_table();
+	TSM_ASSERT_EQUALS("Expected 3 atoms (2 nodes + 1 link)", t.atom_count, 3u);
+
+	// Verify the link at slot 2.
+	{
+		uint16_t type;
+		uint32_t out_buf[16];
+		uint16_t arity = 16;
+		int rc = gpu_fetch_link(&t, 2, &type, out_buf, &arity);
+		TSM_ASSERT_EQUALS("Fetch link failed", rc, 0);
+		TSM_ASSERT_EQUALS("Link type mismatch", type, (uint16_t)LIST_LINK);
+		TSM_ASSERT_EQUALS("Arity mismatch", arity, 2u);
+		TSM_ASSERT_EQUALS("Outgoing[0] should be slot 0", out_buf[0], 0u);
+		TSM_ASSERT_EQUALS("Outgoing[1] should be slot 1", out_buf[1], 1u);
+	}
+
+	// Test link-of-links.
+	Handle isa(createNode(PREDICATE_NODE, "is-a"));
+	Handle evl(createLink(EVALUATION_LINK, isa, lnk));
+	store->storeAtom(evl, true);
+	store->barrier();
+
+	// isa → slot 3, evl → slot 4
+	TSM_ASSERT_EQUALS("Expected 5 atoms", t.atom_count, 5u);
+
+	{
+		uint16_t type;
+		uint32_t out_buf[16];
+		uint16_t arity = 16;
+		int rc = gpu_fetch_link(&t, 4, &type, out_buf, &arity);
+		TSM_ASSERT_EQUALS("Fetch eval link failed", rc, 0);
+		TSM_ASSERT_EQUALS("EvalLink type mismatch", type, (uint16_t)EVALUATION_LINK);
+		TSM_ASSERT_EQUALS("EvalLink arity mismatch", arity, 2u);
+		TSM_ASSERT_EQUALS("EvalLink out[0] = isa (slot 3)", out_buf[0], 3u);
+		TSM_ASSERT_EQUALS("EvalLink out[1] = lnk (slot 2)", out_buf[1], 2u);
+	}
+
+	store->close();
+	delete store;
+
+	printf("test_store_link: PASSED\n");
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+// ============================================================
+// Full round-trip: store from one AtomSpace, load into another.
+
+void GpuBasicSaveUTest::test_roundtrip(void)
+{
+	logger().debug("BEGIN TEST: %s", __FUNCTION__);
+
+	GpuStorageNode* store = new GpuStorageNode(GPU_STORAGE_NODE, "gpu://test");
+	store->open();
+
+	// Build an AtomSpace with some atoms.
+	AtomSpace* as1 = new AtomSpace();
+	Handle cat = as1->add_node(CONCEPT_NODE, "cat");
+	Handle dog = as1->add_node(CONCEPT_NODE, "dog");
+	Handle mammal = as1->add_node(CONCEPT_NODE, "mammal");
+	Handle lnk = as1->add_link(LIST_LINK, cat, dog);
+	Handle inh = as1->add_link(INHERITANCE_LINK, cat, mammal);
+
+	// Store entire AtomSpace to GPU.
+	store->storeAtomSpace(as1);
+	store->barrier();
+
+	TSM_ASSERT_EQUALS("Expected 5 atoms on GPU",
+		store->gpu_table().atom_count, 5u);
+
+	// Load into a fresh AtomSpace.
+	AtomSpace* as2 = new AtomSpace();
+	store->loadAtomSpace(as2);
+
+	// Verify all atoms were reconstructed.
+	size_t sz1 = as1->get_size();
+	size_t sz2 = as2->get_size();
+	printf("Round-trip: stored %lu, loaded %lu atoms\n", sz1, sz2);
+	TSM_ASSERT_EQUALS("Atom count mismatch after round-trip", sz1, sz2);
+
+	// Verify specific atoms exist in as2 (use get_atom with prototype Handle).
+	Handle cat2 = as2->get_atom(createNode(CONCEPT_NODE, "cat"));
+	TSM_ASSERT("cat not found in loaded AS", cat2 != nullptr);
+
+	Handle dog2 = as2->get_atom(createNode(CONCEPT_NODE, "dog"));
+	TSM_ASSERT("dog not found in loaded AS", dog2 != nullptr);
+
+	Handle mammal2 = as2->get_atom(createNode(CONCEPT_NODE, "mammal"));
+	TSM_ASSERT("mammal not found in loaded AS", mammal2 != nullptr);
+
+	// Verify link structure.
+	Handle lnk2 = as2->get_atom(createLink(LIST_LINK, cat2, dog2));
+	TSM_ASSERT("ListLink(cat,dog) not found", lnk2 != nullptr);
+	if (lnk2)
+	{
+		TSM_ASSERT_EQUALS("ListLink arity mismatch",
+			lnk2->get_arity(), lnk->get_arity());
+	}
+
+	Handle inh2 = as2->get_atom(createLink(INHERITANCE_LINK, cat2, mammal2));
+	TSM_ASSERT("InheritanceLink(cat,mammal) not found", inh2 != nullptr);
+
+	store->close();
+	delete store;
+	delete as1;
+	delete as2;
+
+	printf("test_roundtrip: PASSED\n");
+	logger().debug("END TEST: %s", __FUNCTION__);
+}
+
+/* ============================= END OF FILE ================= */

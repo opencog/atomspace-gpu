@@ -1,130 +1,83 @@
 /*
  * opencog/persist/gpu/GpuStorageNode.h
  *
- * StorageNode implementation backed by GPU SoA pools.
- * Provides the standard StorageNode API (store/fetch/query)
- * using GPU-resident word, pair, and section pools.
- * Same pattern as RocksStorageNode (disk) and CogStorageNode
- * (network), but targeting GPU memory.
+ * BackingStore wrapper for GpuAtomTable. Bridges the AtomSpace
+ * persistence API to the GPU atom table (Step 2).
  *
- * Supports CUDA (primary, NVIDIA) and OpenCL (fallback, AMD/Intel).
- * Backend is selected at open() time based on hardware availability
- * and URI hints.
+ * Step 3 of Linas' plan: storeAtom/getAtom via BackingStore.h.
+ * Uses TLB for Handle ↔ GPU-slot identity mapping.
  *
- * URI format: "gpu://[backend:]platform:device"
- *   "gpu://:"              first available device (CUDA preferred)
- *   "gpu://NVIDIA:RTX"     first NVIDIA device containing "RTX"
- *   "gpu://cuda::"         force CUDA backend
- *   "gpu://opencl::"       force OpenCL backend
- *   "gpu://opencl:Intel:"  OpenCL on first Intel device
- *
- * Copyright (C) 2025 OpenCog Foundation
- *
+ * Copyright (C) 2026 OpenCog Foundation
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
 #ifndef _OPENCOG_GPU_STORAGE_NODE_H
 #define _OPENCOG_GPU_STORAGE_NODE_H
 
-#include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <functional>
+#include <vector>
 
+#include <opencog/atomspace/AtomSpace.h>
 #include <opencog/persist/api/StorageNode.h>
-
-#include "gpu-pool-defs.h"
-#include "GpuBackend.h"
+#include <opencog/persist/tlb/TLB.h>
+#include <opencog/persist/gpu-types/atom_types.h>
+#include <opencog/persist/gpu/GpuAtomTable.h>
 
 namespace opencog
 {
 
-/** \addtogroup grp_persist
- *  @{
- */
-
 class GpuStorageNode : public StorageNode
 {
 private:
-	std::string _uri;
-	std::string _backend_hint;  // "cuda", "opencl", or "" (auto)
-	std::string _splat;         // platform substring
-	std::string _sdev;          // device substring
+	GpuAtomTable _gpu_table;
+	TLB _tlb;
+	bool _is_open;
+	std::mutex _mtx;
 
-	// GPU backend (CUDA or OpenCL, selected at open time)
-	std::unique_ptr<GpuBackend> _backend;
-	bool _connected;
+	// Handle → GPU slot (forward lookup).
+	// TLB provides the reverse (slot → Handle).
+	std::unordered_map<Handle, uint32_t,
+	                   std::hash<opencog::Handle>,
+	                   std::equal_to<opencog::Handle>> _handle_to_slot;
 
-	// CPU-side name->hash mapping (GPU stores hashes, CPU knows strings)
-	std::mutex _name_mtx;
-	std::unordered_map<std::string, uint64_t> _name_to_hash;
-	std::unordered_map<uint64_t, std::string> _hash_to_name;
+	// Per-slot node/link flag for two-pass loadAtomSpace.
+	std::vector<bool> _slot_is_node;
 
-	// Atom->GPU-index mapping for Values
-	struct ValueSlot {
-		uint32_t pool_index;  // index in word/pair/section pool
-		int pool_type;        // 0=word, 1=pair, 2=section
-	};
-	std::mutex _atom_mtx;
-	std::unordered_map<Handle, ValueSlot> _atom_map;
-
-	// Internal helpers
-	void parse_uri(void);
-
-	uint64_t name_hash(const std::string& name);
-	uint32_t store_word(const std::string& name);
-	uint32_t store_pair(uint32_t word_a, uint32_t word_b);
-	uint32_t lookup_word(const std::string& name);
-	uint32_t lookup_pair(uint32_t word_a, uint32_t word_b);
-
-	void store_node_values(const Handle&, uint32_t pool_idx);
-	void load_node_values(const Handle&, uint32_t pool_idx);
-	void store_link_values(const Handle&, uint32_t pool_idx);
-	void load_link_values(const Handle&, uint32_t pool_idx);
-
-	// Stats tracking
-	std::atomic<size_t> _num_stores;
-	std::atomic<size_t> _num_fetches;
+	bool has_slot(const Handle&) const;
+	uint32_t assign_slot(const Handle&);
+	void do_store_atom(const Handle&);
 
 public:
 	GpuStorageNode(Type t, const std::string&& uri);
-	GpuStorageNode(const std::string&& uri);
-	GpuStorageNode(const GpuStorageNode&) = delete;
-	GpuStorageNode& operator=(const GpuStorageNode&) = delete;
+	GpuStorageNode(const std::string& uri);
 	virtual ~GpuStorageNode();
 
-	// -- StorageNode interface --
-	void open(void) override;
-	void close(void) override;
-	bool connected(void) override;
+	// StorageNode lifecycle
+	void open(void);
+	void close(void);
+	bool connected(void);
+	void create(void) {}
+	void destroy(void);
+	void erase(void);
 
-	void create(void) override { erase(); }
-	void destroy(void) override { erase(); }
-	void erase(void) override;
+	// BackingStore interface (implemented)
+	void storeAtom(const Handle&, bool synchronous = false);
+	void loadAtomSpace(AtomSpace*);
+	void storeAtomSpace(const AtomSpace*);
+	void barrier(AtomSpace* = nullptr);
+	std::string monitor(void);
 
-	// -- BackingStore interface --
-	void getAtom(const Handle&) override;
-	void storeAtom(const Handle&, bool synchronous = false) override;
-	void removeAtom(AtomSpace*, const Handle&, bool recursive) override;
+	// BackingStore interface (stubbed for Step 3)
+	void getAtom(const Handle&);
+	void fetchIncomingSet(AtomSpace*, const Handle&);
+	void fetchIncomingByType(AtomSpace*, const Handle&, Type);
+	void removeAtom(AtomSpace*, const Handle&, bool recursive);
+	void loadType(AtomSpace*, Type);
 
-	void storeValue(const Handle& atom, const Handle& key) override;
-	void loadValue(const Handle& atom, const Handle& key) override;
+	// Expose GPU table for verification in tests.
+	const GpuAtomTable& gpu_table() const { return _gpu_table; }
 
-	void fetchIncomingSet(AtomSpace*, const Handle&) override;
-	void fetchIncomingByType(AtomSpace*, const Handle&, Type) override;
-	void loadType(AtomSpace*, Type) override;
-	void loadAtomSpace(AtomSpace*) override;
-	void storeAtomSpace(const AtomSpace*) override;
-	void barrier(AtomSpace* = nullptr) override;
-
-	std::string monitor(void) override;
-
-	// -- Phase 2: Query execution on GPU --
-	void runQuery(const Handle&, const Handle&,
-	              const Handle& = Handle::UNDEFINED,
-	              bool = false) override;
-
-	// Atom factory
 	void setAtomSpace(AtomSpace* as)
 	{
 		if (nullptr == as) close();
@@ -136,7 +89,6 @@ public:
 NODE_PTR_DECL(GpuStorageNode)
 #define createGpuStorageNode CREATE_DECL(GpuStorageNode)
 
-/** @}*/
 } // namespace opencog
 
 #endif // _OPENCOG_GPU_STORAGE_NODE_H

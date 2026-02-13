@@ -1,646 +1,285 @@
 /*
  * opencog/persist/gpu/GpuStorageNode.cc
  *
- * StorageNode backed by GPU SoA pools.
- * Delegates all GPU operations to a GpuBackend (CUDA or OpenCL).
+ * BackingStore wrapper for GpuAtomTable. Bridges the AtomSpace
+ * persistence API to the GPU atom table.
  *
- * Phase 1: Store/Fetch round-trip for atoms and values.
+ * Step 3 of Linas' plan: storeAtom/getAtom via BackingStore.h.
  *
- * Copyright (C) 2025 OpenCog Foundation
- *
+ * Copyright (C) 2026 OpenCog Foundation
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-#include <sstream>
-#include <functional>
-#include <cstring>
-
-#include <opencog/util/exceptions.h>
-#include <opencog/util/Logger.h>
-#include <opencog/atomspace/AtomSpace.h>
-#include <opencog/atoms/base/Node.h>
 #include <opencog/atoms/base/Link.h>
-#include <opencog/atoms/value/FloatValue.h>
-#include <opencog/atoms/atom_types/atom_types.h>
-#include <opencog/persist/gpu-types/atom_types.h>
-
-#include "GpuStorageNode.h"
+#include <opencog/atoms/base/Node.h>
+#include <opencog/util/exceptions.h>
+#include <opencog/persist/gpu/GpuStorageNode.h>
 
 using namespace opencog;
 
-// ==============================================================
-// Constructors / Destructor
-
-GpuStorageNode::GpuStorageNode(Type t, const std::string&& uri) :
-	StorageNode(t, std::move(uri)),
-	_connected(false),
-	_num_stores(0),
-	_num_fetches(0)
+GpuStorageNode::GpuStorageNode(Type t, const std::string&& uri)
+	: StorageNode(t, std::move(uri)), _is_open(false)
 {
-	_uri = get_name();
-	parse_uri();
+	memset(&_gpu_table, 0, sizeof(_gpu_table));
 }
 
-GpuStorageNode::GpuStorageNode(const std::string&& uri) :
-	StorageNode(GPU_STORAGE_NODE, std::move(uri)),
-	_connected(false),
-	_num_stores(0),
-	_num_fetches(0)
+GpuStorageNode::GpuStorageNode(const std::string& uri)
+	: StorageNode(GPU_STORAGE_NODE, uri), _is_open(false)
 {
-	_uri = get_name();
-	parse_uri();
+	memset(&_gpu_table, 0, sizeof(_gpu_table));
 }
 
 GpuStorageNode::~GpuStorageNode()
 {
-	if (_connected) close();
+	if (_is_open) close();
 }
 
-// ==============================================================
-// URI parsing: "gpu://[backend:]platform:device"
-//
-// Extended URI format:
-//   "gpu://:"                  → auto backend, any device
-//   "gpu://NVIDIA:RTX"         → auto backend, NVIDIA RTX
-//   "gpu://cuda::"             → force CUDA, any device
-//   "gpu://opencl:Intel:"      → force OpenCL, Intel device
-//   "gpu://cuda:NVIDIA:RTX"    → CUDA, NVIDIA RTX
-
-void GpuStorageNode::parse_uri(void)
-{
-	const std::string& url = _uri;
-	if (0 != url.compare(0, 6, "gpu://"))
-		throw RuntimeException(TRACE_INFO,
-			"Unsupported URL \"%s\"\n"
-			"\tExpecting 'gpu://[backend:]platform:device'",
-			url.c_str());
-
-	std::string rest = url.substr(6);
-
-	// Check for explicit backend hint: "cuda:" or "opencl:"
-	_backend_hint = "";
-	if (rest.compare(0, 5, "cuda:") == 0)
-	{
-		_backend_hint = "cuda";
-		rest = rest.substr(5);
-	}
-	else if (rest.compare(0, 7, "opencl:") == 0)
-	{
-		_backend_hint = "opencl";
-		rest = rest.substr(7);
-	}
-
-	// Parse platform:device from remainder
-	size_t colon = rest.find(':');
-	if (std::string::npos == colon)
-	{
-		_splat = rest;
-		_sdev = "";
-	}
-	else
-	{
-		_splat = rest.substr(0, colon);
-		_sdev = rest.substr(colon + 1);
-	}
-}
-
-// ==============================================================
-// Connection management
+// ================================================================
+// Lifecycle
 
 void GpuStorageNode::open(void)
 {
-	if (_connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: already open! %s\n", _uri.c_str());
+	if (_is_open) return;
 
-	// Select backend: CUDA preferred, OpenCL fallback
-	bool want_cuda = (_backend_hint == "cuda" or _backend_hint.empty());
-	bool want_opencl = (_backend_hint == "opencl" or _backend_hint.empty());
+	int rc = gpu_table_alloc(&_gpu_table);
+	if (rc != 0)
+		throw IOException(TRACE_INFO, "GPU: failed to allocate atom table");
 
-	GpuBackend* be = nullptr;
-
-#ifdef HAVE_CUDA
-	if (want_cuda and nullptr == be)
-	{
-		try
-		{
-			be = create_cuda_backend();
-			be->init(_splat, _sdev);
-		}
-		catch (const RuntimeException& e)
-		{
-			delete be;
-			be = nullptr;
-			if (_backend_hint == "cuda")
-				throw;  // User explicitly asked for CUDA
-			logger().info("GpuStorageNode: CUDA unavailable, "
-				"trying OpenCL...\n");
-		}
-	}
-#endif
-
-#ifdef HAVE_OPENCL
-	if (want_opencl and nullptr == be)
-	{
-		try
-		{
-			be = create_opencl_backend();
-			be->init(_splat, _sdev);
-		}
-		catch (const RuntimeException& e)
-		{
-			delete be;
-			be = nullptr;
-			if (_backend_hint == "opencl")
-				throw;  // User explicitly asked for OpenCL
-		}
-	}
-#endif
-
-	if (nullptr == be)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: no GPU backend available for '%s'\n"
-			"\tCompiled with:"
-#ifdef HAVE_CUDA
-			" CUDA"
-#endif
-#ifdef HAVE_OPENCL
-			" OpenCL"
-#endif
-			"\n",
-			_uri.c_str());
-
-	_backend.reset(be);
-	_backend->alloc_pools();
-	_backend->init_pools();
-
-	_connected = true;
-	_num_stores = 0;
-	_num_fetches = 0;
-
-	logger().info("GpuStorageNode: opened %s (backend: %s, device: %s)\n",
-		_uri.c_str(),
-		_backend->backend_name().c_str(),
-		_backend->device_info().c_str());
+	_is_open = true;
 }
 
 void GpuStorageNode::close(void)
 {
-	if (not _connected) return;
+	if (!_is_open) return;
 
-	_backend->barrier();
-	_backend->shutdown();
-	_backend.reset();
+	gpu_table_barrier(&_gpu_table);
+	gpu_table_free(&_gpu_table);
 
-	// Clear CPU-side maps
-	{
-		std::lock_guard<std::mutex> lk(_name_mtx);
-		_name_to_hash.clear();
-		_hash_to_name.clear();
-	}
-	{
-		std::lock_guard<std::mutex> lk(_atom_mtx);
-		_atom_map.clear();
-	}
+	_tlb.clear();
+	_handle_to_slot.clear();
+	_slot_is_node.clear();
 
-	_connected = false;
-	logger().info("GpuStorageNode: closed %s\n", _uri.c_str());
+	_is_open = false;
 }
 
 bool GpuStorageNode::connected(void)
 {
-	return _connected;
+	return _is_open;
+}
+
+void GpuStorageNode::destroy(void)
+{
+	if (!_is_open) return;
+	gpu_table_clear(&_gpu_table);
+	_gpu_table.atom_count = 0;
+	_gpu_table.name_pool_used = 0;
+	_gpu_table.out_pool_used = 0;
+	_tlb.clear();
+	_handle_to_slot.clear();
+	_slot_is_node.clear();
 }
 
 void GpuStorageNode::erase(void)
 {
-	if (not _connected) return;
-
-	_backend->init_pools();
-
-	{
-		std::lock_guard<std::mutex> lk(_name_mtx);
-		_name_to_hash.clear();
-		_hash_to_name.clear();
-	}
-	{
-		std::lock_guard<std::mutex> lk(_atom_mtx);
-		_atom_map.clear();
-	}
+	destroy();
 }
 
-// ==============================================================
-// Name hashing
+// ================================================================
+// Slot management
+//
+// Each atom gets a sequential GPU slot (0, 1, 2, ...).
+// The TLB maps slot ↔ Handle (UUID = slot).
+// _handle_to_slot provides fast forward lookup.
 
-uint64_t GpuStorageNode::name_hash(const std::string& name)
+bool GpuStorageNode::has_slot(const Handle& h) const
 {
-	std::lock_guard<std::mutex> lk(_name_mtx);
+	return _handle_to_slot.count(h) > 0;
+}
 
-	auto it = _name_to_hash.find(name);
-	if (it != _name_to_hash.end())
+uint32_t GpuStorageNode::assign_slot(const Handle& h)
+{
+	auto it = _handle_to_slot.find(h);
+	if (it != _handle_to_slot.end())
 		return it->second;
 
-	// splitmix64 on std::hash
-	std::hash<std::string> hasher;
-	uint64_t h = hasher(name);
+	uint32_t slot = _gpu_table.atom_count;
+	_gpu_table.atom_count++;
 
-	if (h == GPU_HT_EMPTY_KEY) h = 0;
+	_handle_to_slot[h] = slot;
+	_tlb.addAtom(h, (UUID)slot);
+	_slot_is_node.push_back(h->is_node());
 
-	_name_to_hash[name] = h;
-	_hash_to_name[h] = name;
-	return h;
+	return slot;
 }
 
-// ==============================================================
-// GPU pool operations (delegated to backend)
+// ================================================================
+// Store
 
-uint32_t GpuStorageNode::store_word(const std::string& name)
+void GpuStorageNode::do_store_atom(const Handle& h)
 {
-	uint64_t nhash = name_hash(name);
-	uint32_t idx = _backend->word_find_or_create(nhash);
+	// Already on GPU — nothing to update in Step 3 (no Values).
+	if (has_slot(h)) return;
 
-	if (idx == GPU_NOT_FOUND)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: word pool full, cannot store '%s'\n",
-			name.c_str());
-
-	return idx;
-}
-
-uint32_t GpuStorageNode::lookup_word(const std::string& name)
-{
-	uint64_t nhash = name_hash(name);
-	return _backend->word_lookup(nhash);
-}
-
-uint32_t GpuStorageNode::store_pair(uint32_t word_a, uint32_t word_b)
-{
-	uint32_t idx = _backend->pair_find_or_create(word_a, word_b);
-
-	if (idx == GPU_NOT_FOUND)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: pair pool full\n");
-
-	return idx;
-}
-
-uint32_t GpuStorageNode::lookup_pair(uint32_t word_a, uint32_t word_b)
-{
-	return _backend->pair_lookup(word_a, word_b);
-}
-
-// ==============================================================
-// Value storage helpers
-
-void GpuStorageNode::store_node_values(const Handle& h, uint32_t pool_idx)
-{
-	ValuePtr tv = h->getValue(truth_key());
-	if (nullptr == tv) return;
-
-	FloatValuePtr fv = FloatValueCast(tv);
-	if (nullptr == fv) return;
-
-	const std::vector<double>& vals = fv->value();
-	if (vals.size() > 0)
-		_backend->word_write_count(pool_idx, vals[0]);
-	if (vals.size() > 1)
-		_backend->word_write_marginal(pool_idx, vals[1]);
-}
-
-void GpuStorageNode::load_node_values(const Handle& h, uint32_t pool_idx)
-{
-	double count = 0.0, marginal = 0.0;
-	_backend->word_read_values(pool_idx, count, marginal);
-
-	if (count != 0.0 or marginal != 0.0)
+	// Links: recursively store outgoing atoms first.
+	if (h->is_link())
 	{
-		std::vector<double> vals = {count, marginal};
-		h->setValue(truth_key(), createFloatValue(vals));
+		for (const Handle& out : h->getOutgoingSet())
+			do_store_atom(out);
 	}
-}
 
-void GpuStorageNode::store_link_values(const Handle& h, uint32_t pool_idx)
-{
-	ValuePtr tv = h->getValue(truth_key());
-	if (nullptr == tv) return;
+	uint32_t slot = assign_slot(h);
+	int rc;
 
-	FloatValuePtr fv = FloatValueCast(tv);
-	if (nullptr == fv) return;
-
-	const std::vector<double>& vals = fv->value();
-	if (vals.size() > 0)
-		_backend->pair_write_count(pool_idx, vals[0]);
-	if (vals.size() > 1)
-		_backend->pair_write_mi(pool_idx, vals[1]);
-}
-
-void GpuStorageNode::load_link_values(const Handle& h, uint32_t pool_idx)
-{
-	double count = 0.0, mi = 0.0;
-	_backend->pair_read_values(pool_idx, count, mi);
-
-	if (count != 0.0 or mi != 0.0)
+	if (h->is_node())
 	{
-		std::vector<double> vals = {count, mi};
-		h->setValue(truth_key(), createFloatValue(vals));
+		NodePtr np = NodeCast(h);
+		const std::string& name = np->get_name();
+		rc = gpu_store_node(&_gpu_table, slot,
+			h->get_type(), name.c_str(), (uint16_t)name.size());
 	}
-}
+	else
+	{
+		const HandleSeq& outgoing = h->getOutgoingSet();
+		std::vector<uint32_t> out_slots;
+		out_slots.reserve(outgoing.size());
+		for (const Handle& out : outgoing)
+			out_slots.push_back(_handle_to_slot.at(out));
 
-// ==============================================================
-// StorageNode API: storeAtom
+		rc = gpu_store_link(&_gpu_table, slot,
+			h->get_type(), out_slots.data(), (uint16_t)outgoing.size());
+	}
+
+	if (rc != 0)
+		throw IOException(TRACE_INFO,
+			"GPU: failed to store atom at slot %u", slot);
+}
 
 void GpuStorageNode::storeAtom(const Handle& h, bool synchronous)
 {
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
-
-	NodePtr np = NodeCast(h);
-	if (np)
-	{
-		uint32_t idx = store_word(np->get_name());
-		store_node_values(h, idx);
-
-		std::lock_guard<std::mutex> lk(_atom_mtx);
-		_atom_map[h] = {idx, 0};
-		_num_stores++;
-
-		if (synchronous) _backend->barrier();
-		return;
-	}
-
-	LinkPtr lp = LinkCast(h);
-	if (lp)
-	{
-		for (const Handle& oh : lp->getOutgoingSet())
-			storeAtom(oh, false);
-
-		if (lp->get_arity() == 2)
-		{
-			const Handle& ha = lp->getOutgoingAtom(0);
-			const Handle& hb = lp->getOutgoingAtom(1);
-
-			NodePtr na = NodeCast(ha);
-			NodePtr nb = NodeCast(hb);
-			if (na and nb)
-			{
-				uint32_t ia = store_word(na->get_name());
-				uint32_t ib = store_word(nb->get_name());
-				uint32_t pidx = store_pair(ia, ib);
-				store_link_values(h, pidx);
-
-				std::lock_guard<std::mutex> lk(_atom_mtx);
-				_atom_map[h] = {pidx, 1};
-			}
-		}
-
-		_num_stores++;
-		if (synchronous) _backend->barrier();
-		return;
-	}
+	std::lock_guard<std::mutex> lk(_mtx);
+	do_store_atom(h);
+	if (synchronous)
+		gpu_table_barrier(&_gpu_table);
 }
 
-// ==============================================================
-// StorageNode API: getAtom
-
-void GpuStorageNode::getAtom(const Handle& h)
-{
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
-
-	NodePtr np = NodeCast(h);
-	if (np)
-	{
-		uint32_t idx = lookup_word(np->get_name());
-		if (idx == GPU_NOT_FOUND) return;
-
-		load_node_values(h, idx);
-		_num_fetches++;
-		return;
-	}
-
-	LinkPtr lp = LinkCast(h);
-	if (lp and lp->get_arity() == 2)
-	{
-		const Handle& ha = lp->getOutgoingAtom(0);
-		const Handle& hb = lp->getOutgoingAtom(1);
-
-		NodePtr na = NodeCast(ha);
-		NodePtr nb = NodeCast(hb);
-		if (na and nb)
-		{
-			uint32_t ia = lookup_word(na->get_name());
-			uint32_t ib = lookup_word(nb->get_name());
-			if (ia == GPU_NOT_FOUND or ib == GPU_NOT_FOUND) return;
-
-			uint32_t pidx = lookup_pair(ia, ib);
-			if (pidx == GPU_NOT_FOUND) return;
-
-			load_link_values(h, pidx);
-			_num_fetches++;
-		}
-	}
-}
-
-// ==============================================================
-// StorageNode API: storeValue / loadValue
-
-void GpuStorageNode::storeValue(const Handle& atom, const Handle& key)
-{
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
-
-	if (key != truth_key()) return;
-
-	NodePtr np = NodeCast(atom);
-	if (np)
-	{
-		uint32_t idx = store_word(np->get_name());
-		store_node_values(atom, idx);
-		return;
-	}
-
-	LinkPtr lp = LinkCast(atom);
-	if (lp and lp->get_arity() == 2)
-	{
-		NodePtr na = NodeCast(lp->getOutgoingAtom(0));
-		NodePtr nb = NodeCast(lp->getOutgoingAtom(1));
-		if (na and nb)
-		{
-			uint32_t ia = store_word(na->get_name());
-			uint32_t ib = store_word(nb->get_name());
-			uint32_t pidx = store_pair(ia, ib);
-			store_link_values(atom, pidx);
-		}
-	}
-}
-
-void GpuStorageNode::loadValue(const Handle& atom, const Handle& key)
-{
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
-
-	if (key != truth_key()) return;
-
-	NodePtr np = NodeCast(atom);
-	if (np)
-	{
-		uint32_t idx = lookup_word(np->get_name());
-		if (idx != GPU_NOT_FOUND)
-			load_node_values(atom, idx);
-		return;
-	}
-
-	LinkPtr lp = LinkCast(atom);
-	if (lp and lp->get_arity() == 2)
-	{
-		NodePtr na = NodeCast(lp->getOutgoingAtom(0));
-		NodePtr nb = NodeCast(lp->getOutgoingAtom(1));
-		if (na and nb)
-		{
-			uint32_t ia = lookup_word(na->get_name());
-			uint32_t ib = lookup_word(nb->get_name());
-			if (ia != GPU_NOT_FOUND and ib != GPU_NOT_FOUND)
-			{
-				uint32_t pidx = lookup_pair(ia, ib);
-				if (pidx != GPU_NOT_FOUND)
-					load_link_values(atom, pidx);
-			}
-		}
-	}
-}
-
-// ==============================================================
-// StorageNode API: removeAtom
-
-void GpuStorageNode::removeAtom(AtomSpace*, const Handle& h, bool recursive)
-{
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
-
-	NodePtr np = NodeCast(h);
-	if (np)
-	{
-		uint64_t nhash = name_hash(np->get_name());
-		_backend->word_delete(nhash);
-
-		std::lock_guard<std::mutex> lk(_atom_mtx);
-		_atom_map.erase(h);
-	}
-}
-
-// ==============================================================
-// StorageNode API: bulk operations
-
-void GpuStorageNode::fetchIncomingSet(AtomSpace*, const Handle&)
-{
-}
-
-void GpuStorageNode::fetchIncomingByType(AtomSpace*, const Handle&, Type)
-{
-}
-
-void GpuStorageNode::loadType(AtomSpace*, Type)
-{
-}
+// ================================================================
+// Load
+//
+// Reconstruct atoms from GPU data. Two-pass: nodes first (no
+// dependencies), then links (outgoing references resolved via
+// the slot→Handle vector built during pass 1).
 
 void GpuStorageNode::loadAtomSpace(AtomSpace* as)
 {
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
+	if (!_is_open) return;
 
-	uint32_t nwords = _backend->word_pool_count();
-	if (0 == nwords) return;
+	gpu_table_barrier(&_gpu_table);
 
-	std::vector<uint64_t> hashes(nwords);
-	std::vector<double> counts(nwords);
-	std::vector<double> marginals(nwords);
-	_backend->word_read_bulk(nwords, hashes.data(),
-		counts.data(), marginals.data());
+	uint32_t n = _gpu_table.atom_count;
+	std::vector<Handle> loaded(n);
 
-	std::lock_guard<std::mutex> lk(_name_mtx);
-	for (uint32_t i = 0; i < nwords; i++)
+	// Pass 1: nodes
+	for (uint32_t slot = 0; slot < n; slot++)
 	{
-		auto it = _hash_to_name.find(hashes[i]);
-		if (it == _hash_to_name.end()) continue;
+		if (!_slot_is_node[slot]) continue;
 
-		std::string name = it->second;
-		Handle h = as->add_node(SCHEMA_NODE, std::move(name));
-		if (counts[i] != 0.0 or marginals[i] != 0.0)
-		{
-			std::vector<double> vals = {counts[i], marginals[i]};
-			h->setValue(truth_key(), createFloatValue(vals));
-		}
+		uint16_t type;
+		char name_buf[4096];
+		uint16_t name_len = sizeof(name_buf);
+
+		int rc = gpu_fetch_node(&_gpu_table, slot,
+			&type, name_buf, &name_len);
+		if (rc != 0) continue;
+
+		std::string name(name_buf, name_len);
+		loaded[slot] = as->add_node(type, std::move(name));
+	}
+
+	// Pass 2: links (outgoing slots are always < current slot
+	// because do_store_atom stores outgoing first).
+	for (uint32_t slot = 0; slot < n; slot++)
+	{
+		if (_slot_is_node[slot]) continue;
+
+		uint16_t type;
+		uint32_t out_buf[256];
+		uint16_t arity = sizeof(out_buf) / sizeof(out_buf[0]);
+
+		int rc = gpu_fetch_link(&_gpu_table, slot,
+			&type, out_buf, &arity);
+		if (rc != 0) continue;
+
+		HandleSeq outgoing;
+		outgoing.reserve(arity);
+		for (uint16_t i = 0; i < arity; i++)
+			outgoing.push_back(loaded[out_buf[i]]);
+
+		loaded[slot] = as->add_link(type, std::move(outgoing));
 	}
 }
 
 void GpuStorageNode::storeAtomSpace(const AtomSpace* as)
 {
-	if (not _connected)
-		throw RuntimeException(TRACE_INFO,
-			"GpuStorageNode: not connected!\n");
+	HandleSeq all;
+	as->get_handles_by_type(all, ATOM, true);
 
-	HandleSeq all_atoms;
-	as->get_handles_by_type(all_atoms, ATOM, true);
-	for (const Handle& h : all_atoms)
-		storeAtom(h, false);
-
-	_backend->barrier();
+	std::lock_guard<std::mutex> lk(_mtx);
+	for (const Handle& h : all)
+		do_store_atom(h);
 }
 
-// ==============================================================
-// Barrier
+// ================================================================
+// Fetch (Step 3: no Values stored yet)
+
+void GpuStorageNode::getAtom(const Handle&)
+{
+	// Step 3: no Values on GPU. Nothing to load.
+}
+
+void GpuStorageNode::fetchIncomingSet(AtomSpace*, const Handle&) {}
+void GpuStorageNode::fetchIncomingByType(AtomSpace*, const Handle&, Type) {}
+void GpuStorageNode::removeAtom(AtomSpace*, const Handle&, bool) {}
+void GpuStorageNode::loadType(AtomSpace*, Type) {}
+
+// ================================================================
+// Synchronization
 
 void GpuStorageNode::barrier(AtomSpace*)
 {
-	if (_connected)
-		_backend->barrier();
+	if (_is_open)
+		gpu_table_barrier(&_gpu_table);
 }
 
-// ==============================================================
-// Monitor / Stats
+// ================================================================
+// Diagnostics
 
 std::string GpuStorageNode::monitor(void)
 {
-	std::ostringstream ss;
-	ss << "GpuStorageNode: " << _uri << "\n";
-	ss << "  Connected: " << (_connected ? "yes" : "no") << "\n";
-
-	if (_connected)
+	std::string s;
+	s += "GPU Storage Monitor\n";
+	s += "Connected: ";
+	s += (_is_open ? "yes" : "no");
+	s += "\n";
+	if (_is_open)
 	{
-		ss << "  Backend:  " << _backend->backend_name() << "\n";
-		ss << "  Device:   " << _backend->device_info() << "\n";
-		ss << "  Words:    " << _backend->word_pool_count()
-		   << " / " << GPU_WORD_CAPACITY << "\n";
-		ss << "  Pairs:    " << _backend->pair_pool_count()
-		   << " / " << GPU_PAIR_CAPACITY << "\n";
-		ss << "  Sections: " << _backend->section_pool_count()
-		   << " / " << GPU_SECTION_CAPACITY << "\n";
-		ss << "  Stores:   " << _num_stores.load() << "\n";
-		ss << "  Fetches:  " << _num_fetches.load() << "\n";
+		s += "Backend: ";
+		switch (_gpu_table.backend) {
+			case GPU_BACKEND_CUDA:   s += "CUDA\n"; break;
+			case GPU_BACKEND_OPENCL: s += "OpenCL\n"; break;
+			default:                 s += "None\n"; break;
+		}
+		s += "Atoms: " + std::to_string(_gpu_table.atom_count) + "\n";
+		s += "Name pool: " + std::to_string(_gpu_table.name_pool_used) + " bytes\n";
+		s += "Out pool: " + std::to_string(_gpu_table.out_pool_used) + " slots\n";
 	}
-
-	return ss.str();
+	return s;
 }
 
-// ==============================================================
-// Phase 2: runQuery (stub)
-
-void GpuStorageNode::runQuery(const Handle& query, const Handle& key,
-                              const Handle& metadata_key, bool fresh)
-{
-	throw RuntimeException(TRACE_INFO,
-		"GpuStorageNode::runQuery() not yet implemented (Phase 2)\n");
-}
-
-// ==============================================================
+// ================================================================
 // Factory
 
-DEFINE_NODE_FACTORY(GpuStorageNode, GPU_STORAGE_NODE);
-
-// ==============================================================
+Handle GpuStorageNode::factory(const Handle& base)
+{
+	Handle h(createGpuStorageNode(base->get_name()));
+	return h;
+}

@@ -1,4 +1,5 @@
-# Generate the atom types
+# Generate the GPU atom types
+
 OPENCOG_GEN_CXX_ATOMTYPES(atom_types.script
 	atom_types.h
 	atom_types.definitions
@@ -11,7 +12,7 @@ ADD_CUSTOM_TARGET(persist_gpu_atom_types
 	DEPENDS atom_types.h persist_gpu_types.scm persist_gpu_types.pyx)
 
 # Build the shared library
-ADD_LIBRARY (persist-gpu-types SHARED
+ADD_LIBRARY(persist-gpu-types SHARED
 	atom_types_init.cc
 )
 
@@ -26,19 +27,17 @@ TARGET_LINK_LIBRARIES(persist-gpu-types
 ADD_DEPENDENCIES(persist-gpu-types persist_gpu_atom_types)
 
 # Install targets
-INSTALL (TARGETS persist-gpu-types EXPORT AtomSpaceGPUTargets
+INSTALL(TARGETS persist-gpu-types EXPORT AtomSpaceGPUTargets
 	DESTINATION "${CMAKE_INSTALL_LIBDIR}/opencog"
 )
 
-INSTALL (FILES
+INSTALL(FILES
 	${CMAKE_CURRENT_BINARY_DIR}/atom_types.h
 	DESTINATION "include/opencog/persist/gpu-types"
 )
 
-ADD_GUILE_MODULE (FILES
+ADD_GUILE_MODULE(FILES
 	${CMAKE_CURRENT_BINARY_DIR}/persist_gpu_types.scm
 	MODULE_DESTINATION "${GUILE_SITE_DIR}/opencog/persist/gpu-types"
 	DEPENDS persist_gpu_atom_types
 )
-
-ADD_GUILE_EXTENSION(SCM_CONFIG persist-gpu-types "opencog-ext-path-persist-gpu-types")

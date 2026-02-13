@@ -1,42 +1,48 @@
 #
-# Build the GPU driver for the AtomSpace.
+# Build the GPU AtomTable library.
 # Supports CUDA (preferred) and OpenCL (fallback).
 #
+# Step 2: AoS atom table (GpuAtomTable)
+# Step 3: BackingStore wrapper (GpuStorageNode)
+#
 
-# -- Core StorageNode (backend-agnostic) --
-SET(GPU_SOURCES GpuStorageNode.cc)
+# -- Sources: dispatch layer always compiled, backends conditional --
+SET(GPU_SOURCES
+	GpuAtomTable_dispatch.cc
+	GpuStorageNode.cc
+)
 SET(GPU_LINK_LIBS
 	persist-gpu-types
-	persist
 	${ATOMSPACE_STORAGE_LIBRARIES}
 	${ATOMSPACE_LIBRARIES}
 )
 SET(GPU_INSTALL_HEADERS
+	GpuAtomTable.h
 	GpuStorageNode.h
-	GpuBackend.h
-	gpu-pool-defs.h
 )
 
-# -- OpenCL backend (optional) --
-IF (HAVE_OPENCL)
-	LIST(APPEND GPU_SOURCES OpenCLBackend.cc)
-	LIST(APPEND GPU_LINK_LIBS OpenCL::OpenCL)
-	LIST(APPEND GPU_INSTALL_HEADERS opencl-headers.h OpenCLBackend.h)
-ENDIF (HAVE_OPENCL)
-
-# -- CUDA backend (optional, preferred) --
 IF (HAVE_CUDA)
-	LIST(APPEND GPU_SOURCES CudaBackend.cu)
-	LIST(APPEND GPU_INSTALL_HEADERS CudaBackend.h)
+	LIST(APPEND GPU_SOURCES GpuAtomTable.cu)
 ENDIF (HAVE_CUDA)
+
+IF (HAVE_OPENCL)
+	LIST(APPEND GPU_SOURCES GpuAtomTable_ocl.cc)
+	LIST(APPEND GPU_LINK_LIBS OpenCL::OpenCL)
+	LIST(APPEND GPU_INSTALL_HEADERS opencl-headers.h)
+ENDIF (HAVE_OPENCL)
 
 # -- Build the library --
 ADD_LIBRARY(persist-gpu SHARED ${GPU_SOURCES})
 
-# The atom_types.h file is written to the build directory
-TARGET_INCLUDE_DIRECTORIES(persist-gpu PRIVATE ${CMAKE_BINARY_DIR})
+TARGET_INCLUDE_DIRECTORIES(persist-gpu PRIVATE
+	${PROJECT_SOURCE_DIR}
+	${CMAKE_BINARY_DIR}
+)
 
 TARGET_LINK_LIBRARIES(persist-gpu ${GPU_LINK_LIBS})
+
+# GpuStorageNode depends on generated atom types header.
+ADD_DEPENDENCIES(persist-gpu persist_gpu_atom_types)
 
 IF (HAVE_CUDA)
 	SET_TARGET_PROPERTIES(persist-gpu PROPERTIES
@@ -45,13 +51,6 @@ IF (HAVE_CUDA)
 	)
 ENDIF (HAVE_CUDA)
 
-ADD_DEPENDENCIES(persist-gpu persist_gpu_atom_types)
-
-ADD_GUILE_EXTENSION(SCM_CONFIG persist-gpu
-	"opencog-ext-path-persist-gpu")
-
-# The EXPORT is needed to autogenerate CMake boilerplate in the lib
-# directory that lets other packages FIND_PACKAGE(AtomSpaceGPU)
 INSTALL (TARGETS persist-gpu
 	EXPORT AtomSpaceGPUTargets
 	DESTINATION "${CMAKE_INSTALL_LIBDIR}/opencog"
@@ -60,4 +59,3 @@ INSTALL (TARGETS persist-gpu
 INSTALL (FILES ${GPU_INSTALL_HEADERS}
 	DESTINATION "include/opencog/persist/gpu"
 )
-
